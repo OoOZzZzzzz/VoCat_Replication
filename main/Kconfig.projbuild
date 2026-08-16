@@ -25,6 +25,23 @@ config OTA_URL
 #         depends on USE_EMOTE_MESSAGE_STYLE
 # endchoice
 
+choice DISPLAY_STYLE
+    prompt "Select display style"
+    default USE_EMOTE_MESSAGE_STYLE
+    help
+        Select display style for Xiaozhi device
+
+    config USE_DEFAULT_MESSAGE_STYLE
+        bool "Enable default message style"
+
+    config USE_WECHAT_MESSAGE_STYLE
+        bool "Enable WeChat Message Style"
+
+    config USE_EMOTE_MESSAGE_STYLE
+        bool "Emote animation style"
+        depends on BOARD_TYPE_ESP_VOCAT
+endchoice
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE
@@ -150,24 +167,6 @@ choice BOARD_TYPE
         bool "Espressif ESP-VoCat"
         depends on IDF_TARGET_ESP32S3
 
-endchoice
-
-
-choice DISPLAY_STYLE
-    prompt "Select display style"
-    default USE_DEFAULT_MESSAGE_STYLE
-    help
-        Select display style for Xiaozhi device
-
-    config USE_DEFAULT_MESSAGE_STYLE
-        bool "Enable default message style"
-
-    config USE_WECHAT_MESSAGE_STYLE
-        bool "Enable WeChat Message Style"
-
-    config USE_EMOTE_MESSAGE_STYLE
-        bool "Emote animation style"
-        depends on BOARD_TYPE_ESP_VOCAT
 endchoice
 
 config USE_MULTILINE_CHAT_MESSAGE

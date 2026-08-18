@@ -1,4 +1,5 @@
 #include "application.h"
+#include "custom/vocat_bilibili_ui.hpp"
 #include "backlight.h"
 #include "button.h"
 #include "codecs/box_audio_codec.h"
@@ -712,6 +713,10 @@ private:
                 auto touch_event = touchpad->CheckTouchEvent();
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
+                    const auto& point = touchpad->GetTouchPoint();
+                    if (vocat_bilibili_ui_handle_touch(point.x, point.y)) {
+                        continue;
+                    }
                     if (app.GetDeviceState() == kDeviceStateStarting) {
                         board.EnterWifiConfigMode();
                     } else {

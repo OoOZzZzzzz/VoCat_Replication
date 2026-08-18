@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "vocat_bilibili_ui.hpp"
 
 #define TAG "MCP"
 
@@ -62,7 +63,7 @@ void McpServer::AddCommonTools() {
             codec->SetOutputVolume(properties["volume"].value<int>());
             return true;
         });
-    
+
     auto backlight = board.GetBacklight();
     if (backlight) {
         AddTool("self.screen.set_brightness",
@@ -120,6 +121,26 @@ void McpServer::AddCommonTools() {
             });
     }
 #endif
+
+    AddTool(
+        "self.web.open_bilibili",
+        "打开B站热门榜单，联网后在屏幕展示视频列表，用户要求打开B站时调用",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            vocat_bilibili_render_screen_async();
+            return true;
+        }
+    );
+
+    AddTool(
+        "self.web.close_bilibili",
+        "清空屏幕上的B站页面",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            vocat_bilibili_ui_clear();
+            return true;
+        }
+    );
 
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());

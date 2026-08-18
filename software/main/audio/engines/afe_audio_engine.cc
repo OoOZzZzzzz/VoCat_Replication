@@ -174,7 +174,7 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms, srmode
         auto* engine = static_cast<AfeAudioEngine*>(arg);
         engine->ProcessingTask();
         vTaskDelete(nullptr);
-    }, "audio_afe", 4096, this, 3, &processing_task_);
+    }, "audio_afe", 8192, this, 3, &processing_task_);
     if (task_created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create AFE processing task");
         afe_iface_->destroy(afe_data_);

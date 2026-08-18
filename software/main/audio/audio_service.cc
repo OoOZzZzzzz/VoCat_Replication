@@ -187,6 +187,59 @@ void AudioService::Stop() {
     }
 }
 
+void AudioService::SetExternalMediaPlaybackMode(bool enable)
+{
+    if (audio_output_task_handle_ == nullptr) {
+        return;
+    }
+
+    // Native audio output normally runs at priority 4. During Bilibili playback
+    // it must not compete head-to-head with the video JPEG decoder (also priority 4).
+    // Keep a small PCM queue so output remains continuous while yielding CPU to video.
+    vTaskPrioritySet(
+        audio_output_task_handle_,
+        enable ? 2 : 4
+    );
+}
+
+bool AudioService::PushPcmToPlaybackQueue(const int16_t* pcm, size_t samples, int sample_rate)
+{
+    if (pcm == nullptr || samples == 0 || codec_ == nullptr) {
+        return false;
+    }
+
+    if (sample_rate != codec_->output_sample_rate()) {
+        ESP_LOGE(TAG, "Direct PCM sample rate mismatch: %d != codec %d",
+                 sample_rate, codec_->output_sample_rate());
+        return false;
+    }
+
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->pcm.assign(pcm, pcm + samples);
+
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+
+    if (service_stopped_.load()) {
+        return false;
+    }
+
+    /*
+     * Bilibili is a live media source. Never block the network reader waiting
+     * for AudioOutputTask. Keeping at most ~300 ms of direct media PCM avoids
+     * back-pressure from audio starving the video stream.
+     */
+    constexpr size_t kDirectPcmMaxQueue = 3;
+    while (audio_playback_queue_.size() >= kDirectPcmMaxQueue) {
+        audio_playback_queue_.pop_front();
+    }
+
+    playback_drained_notified_ = false;
+    audio_playback_queue_.push_back(std::move(task));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
     if (!codec_->input_enabled()) {
         esp_timer_stop(audio_power_timer_);

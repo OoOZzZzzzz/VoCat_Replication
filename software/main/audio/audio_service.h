@@ -134,6 +134,10 @@ public:
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
+    // Direct PCM playback path for external media streams (already decoded PCM).
+    bool PushPcmToPlaybackQueue(const int16_t* pcm, size_t samples, int sample_rate);
+    // Lower the native audio output task while external media is playing, then restore it.
+    void SetExternalMediaPlaybackMode(bool enable);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 

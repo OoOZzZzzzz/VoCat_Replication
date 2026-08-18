@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <string>
+#include <vector>
 
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
@@ -20,6 +21,7 @@
 #include "esp_jpeg_dec.h"
 #include "esp_jpeg_common.h"
 #include "display/lvgl_display/jpg/jpeg_to_image.h"
+#include "audio_service.h"
 
 #define TAG "BILI_UI"
 #define BILI_TASK_STACK_SIZE (12 * 1024)
@@ -32,6 +34,11 @@
 #define BILI_FRAME_BUF_COUNT 4
 #define BILI_JPEG_BUF_SIZE (96 * 1024)
 #define BILI_PLAY_URL_BASE "http://192.168.31.106:8000/bili/play?bvid="
+#define BILI_AUDIO_URL_BASE "http://192.168.31.106:8000/bili/audio?bvid="
+#define BILI_AUDIO_SAMPLE_RATE 24000
+#define BILI_AUDIO_CHUNK_SAMPLES 2400
+#define BILI_AUDIO_PREBUFFER_CHUNKS 2
+#define BILI_AUDIO_CHUNK_BYTES (BILI_AUDIO_CHUNK_SAMPLES * sizeof(int16_t))
 
 namespace {
 
@@ -60,6 +67,9 @@ struct State {
     volatile bool active = false;
     volatile bool player = false;
     volatile bool stop_player = false;
+    volatile bool stop_audio = false;
+    volatile bool audio_ready = false;
+    volatile bool audio_failed = false;
     int selected = -1;
 
     bili_video_t videos[BILI_ROW_COUNT] = {};
@@ -67,6 +77,7 @@ struct State {
 
     TaskHandle_t fetch_task = nullptr;
     TaskHandle_t player_task = nullptr;
+    TaskHandle_t audio_task = nullptr;
 };
 
 static State s;
@@ -377,6 +388,12 @@ static void show_player_locked(emote_handle_t h, int index)
     s.player = true;
     s.selected = index;
     s.stop_player = false;
+    s.stop_audio = false;
+
+    // Give the video decoder the CPU headroom it needs while Bilibili media is playing.
+    Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(true);
+    s.audio_ready = false;
+    s.audio_failed = false;
 
     set_text(s.page, "", 0x101010, 0, 0, 360, 360, 0x101010, true);
     show(s.page);
@@ -391,6 +408,221 @@ static void show_player_locked(emote_handle_t h, int index)
              0xD0D0D0, 8, 288, 344, 28, 0x202020, true);
 
     emote_notify_all_refresh(h);
+}
+
+static void stop_bili_audio()
+{
+    s.stop_audio = true;
+    s.audio_ready = true;
+    s.audio_failed = true;
+    // Drop any queued Bilibili PCM immediately. The AudioService playback
+    // worker may still be draining the previous chunk, but no new media
+    // audio will be accepted after this point.
+    Application::GetInstance().GetAudioService().ResetDecoder();
+    Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(false);
+}
+
+static void audio_task(void*)
+{
+    const int index = s.selected;
+    if (index < 0 || index >= s.count) {
+        s.audio_failed = true;
+        s.audio_ready = true;
+        s.audio_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    char url[320];
+    snprintf(url, sizeof(url), "%s%s", BILI_AUDIO_URL_BASE, s.videos[index].bvid);
+    ESP_LOGI(TAG, "[Audio] open %s", url);
+
+    esp_http_client_config_t cfg = {};
+    cfg.url = url;
+    cfg.timeout_ms = 15000;
+    cfg.buffer_size = 8192;
+    cfg.buffer_size_tx = 1024;
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "[Audio] http init failed");
+        s.audio_failed = true;
+        s.audio_ready = true;
+        s.audio_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (esp_http_client_open(client, 0) != ESP_OK) {
+        ESP_LOGE(TAG, "[Audio] open failed");
+        esp_http_client_cleanup(client);
+        s.audio_failed = true;
+        s.audio_ready = true;
+        s.audio_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    int64_t content_length = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "[Audio] connected status=%d content_len=%lld", status, content_length);
+
+    if (status != 200) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        s.audio_failed = true;
+        s.audio_ready = true;
+        s.audio_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // IMPORTANT: keep all large buffers on heap, not on the FreeRTOS task stack.
+    uint8_t* rx = static_cast<uint8_t*>(heap_caps_malloc(8192, MALLOC_CAP_8BIT));
+    uint8_t* pcm_bytes = static_cast<uint8_t*>(heap_caps_malloc(BILI_AUDIO_CHUNK_BYTES, MALLOC_CAP_8BIT));
+    if (!rx || !pcm_bytes) {
+        ESP_LOGE(TAG, "[Audio] heap buffer allocation failed");
+        if (rx) heap_caps_free(rx);
+        if (pcm_bytes) heap_caps_free(pcm_bytes);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        s.audio_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    size_t pcm_used = 0;
+    uint32_t chunks = 0;
+    size_t prebuffer_samples = 0;
+    std::vector<int16_t> prebuffer;
+    prebuffer.reserve(BILI_AUDIO_CHUNK_SAMPLES * BILI_AUDIO_PREBUFFER_CHUNKS);
+
+    auto& audio = Application::GetInstance().GetAudioService();
+
+    while (!s.stop_audio && s.active && s.player) {
+        int n = esp_http_client_read(client, reinterpret_cast<char*>(rx), 8192);
+
+        if (n < 0) {
+            if (n == -ESP_ERR_HTTP_EAGAIN) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            ESP_LOGE(TAG, "[Audio] stream read error=%d", n);
+            s.audio_failed = true;
+            break;
+        }
+
+        if (n == 0) {
+            if (esp_http_client_is_complete_data_received(client)) {
+                ESP_LOGI(TAG, "[Audio] stream ended");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        size_t off = 0;
+        while (off < static_cast<size_t>(n) && !s.stop_audio && s.active && s.player) {
+            const size_t copy_len = std::min(
+                BILI_AUDIO_CHUNK_BYTES - pcm_used,
+                static_cast<size_t>(n) - off);
+
+            memcpy(pcm_bytes + pcm_used, rx + off, copy_len);
+            pcm_used += copy_len;
+            off += copy_len;
+
+            if (pcm_used != BILI_AUDIO_CHUNK_BYTES) {
+                continue;
+            }
+
+            /*
+             * Keep the first 200 ms locally. Video is allowed to publish its
+             * first frame only after this prebuffer is ready, so both streams
+             * start from approximately the same media time.
+             */
+            if (prebuffer_samples < BILI_AUDIO_CHUNK_SAMPLES * BILI_AUDIO_PREBUFFER_CHUNKS) {
+                const auto* src = reinterpret_cast<const int16_t*>(pcm_bytes);
+                prebuffer.insert(
+                    prebuffer.end(),
+                    src,
+                    src + BILI_AUDIO_CHUNK_SAMPLES);
+                prebuffer_samples += BILI_AUDIO_CHUNK_SAMPLES;
+
+                if (prebuffer_samples ==
+                    BILI_AUDIO_CHUNK_SAMPLES * BILI_AUDIO_PREBUFFER_CHUNKS) {
+
+                    for (int block = 0; block < BILI_AUDIO_PREBUFFER_CHUNKS; ++block) {
+                        const int16_t* block_ptr =
+                            prebuffer.data() + block * BILI_AUDIO_CHUNK_SAMPLES;
+
+                        if (audio.PushPcmToPlaybackQueue(
+                                block_ptr,
+                                BILI_AUDIO_CHUNK_SAMPLES,
+                                BILI_AUDIO_SAMPLE_RATE)) {
+                            ++chunks;
+                        } else {
+                            ESP_LOGW(TAG, "[Audio] prebuffer chunk dropped");
+                        }
+                    }
+
+                    prebuffer.clear();
+                    s.audio_ready = true;
+                }
+            } else {
+                const int16_t* block_ptr =
+                    reinterpret_cast<const int16_t*>(pcm_bytes);
+
+                if (audio.PushPcmToPlaybackQueue(
+                        block_ptr,
+                        BILI_AUDIO_CHUNK_SAMPLES,
+                        BILI_AUDIO_SAMPLE_RATE)) {
+                    ++chunks;
+                }
+            }
+
+            if (chunks > 0 &&
+                (chunks <= 2 || (chunks % 20) == 0)) {
+                ESP_LOGI(TAG, "[Audio] PCM chunk=%lu",
+                         (unsigned long)chunks);
+            }
+
+            pcm_used = 0;
+        }
+    }
+
+    /*
+     * If audio died before the 200 ms prebuffer completed, unblock the video
+     * so the device can still show video without waiting forever.
+     */
+    if (!s.audio_ready) {
+        s.audio_ready = true;
+    }
+
+    heap_caps_free(rx);
+    heap_caps_free(pcm_bytes);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    ESP_LOGI(TAG, "[Audio] task exit chunks=%lu", (unsigned long)chunks);
+    s.audio_task = nullptr;
+    if (s.player_task == nullptr) {
+        Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(false);
+    }
+    vTaskDelete(nullptr);
+}
+
+static bool start_audio_task(int index)
+{
+    if (s.audio_task != nullptr) return true;
+    s.stop_audio = false;
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        audio_task, "bili_audio", 6144, nullptr, 2, &s.audio_task, 0);
+    if (ret != pdPASS) {
+        s.audio_task = nullptr;
+        ESP_LOGE(TAG, "[Audio] task create failed");
+        return false;
+    }
+    ESP_LOGI(TAG, "[Audio] task created index=%d", index);
+    return true;
 }
 
 static bool start_player_task(int index);
@@ -566,11 +798,20 @@ static void player_task(void *)
 
     int used = 0;
     bool first_frame = true;
+    uint32_t frame_count = 0;
+    bool first_frame_gate = false;
+    const int64_t first_frame_wait_start = esp_timer_get_time();
     uint8_t rx[8192];
 
     while (!s.stop_player && s.active && s.player) {
         int n = esp_http_client_read(client, reinterpret_cast<char *>(rx), sizeof(rx));
         if (n < 0) {
+            // Live MJPEG is intentionally chunked. A timeout before the next
+            // JPEG is not a stream failure; keep the connection alive.
+            if (n == -ESP_ERR_HTTP_EAGAIN) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
             ESP_LOGE(TAG, "[Player] stream read error=%d", n);
             update_player_status("视频流读取失败");
             break;
@@ -626,7 +867,25 @@ static void player_task(void *)
             if (end < 0) break;
 
             int frame_len = end + 1;
+
+            if (!first_frame_gate) {
+                /*
+                 * Wait for the audio prebuffer, but never wait longer than
+                 * 1500 ms. This establishes a common A/V start point without
+                 * allowing a failed audio stream to block video indefinitely.
+                 */
+                while (!s.audio_ready && !s.stop_player && s.active && s.player &&
+                       (esp_timer_get_time() - first_frame_wait_start) < 1500000) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+                first_frame_gate = true;
+            }
+
             if (decode_and_publish(jpeg_buf, frame_len)) {
+                ++frame_count;
+                if (frame_count <= 3 || (frame_count % 10) == 0) {
+                    ESP_LOGI(TAG, "[Player] frame=%lu", (unsigned long)frame_count);
+                }
                 if (first_frame) {
                     first_frame = false;
                     update_player_status("");
@@ -648,6 +907,9 @@ static void player_task(void *)
 
     ESP_LOGI(TAG, "[Player] task exit");
     s.player_task = nullptr;
+    if (s.audio_task == nullptr) {
+        Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(false);
+    }
     vTaskDelete(nullptr);
 }
 
@@ -657,6 +919,7 @@ static bool start_player_task(int index)
 
     s.selected = index;
     s.stop_player = false;
+    s.stop_audio = false;
 
     BaseType_t ret = xTaskCreatePinnedToCore(
         player_task,
@@ -690,6 +953,10 @@ static void schedule_player(int index)
         }
         emote_unlock(h);
 
+        // Start audio first. The server-side media URL cache is shared between
+        // /bili/play and /bili/audio, so both streams now start from the same
+        // resolved DASH source without a second B站 playurl request.
+        start_audio_task(index);
         start_player_task(index);
     });
 }
@@ -781,6 +1048,7 @@ extern "C" void vocat_bilibili_render_screen_async(void)
 extern "C" void vocat_bilibili_ui_clear(void)
 {
     s.stop_player = true;
+    stop_bili_audio();
 
     Application::GetInstance().Schedule([]() {
         emote_handle_t h = get_emote_handle();
@@ -793,7 +1061,6 @@ extern "C" void vocat_bilibili_ui_clear(void)
             s.player = false;
             s.selected = -1;
             emote_stop_anim_dialog(h);
-            emote_set_anim_visible(h, true);
             emote_notify_all_refresh(h);
         }
         emote_unlock(h);
@@ -809,6 +1076,7 @@ extern "C" bool vocat_bilibili_ui_handle_touch(int x, int y)
     if (s.player) {
         if (x <= 100 && y <= 50) {
             s.stop_player = true;
+            stop_bili_audio();
             Application::GetInstance().Schedule([]() {
                 emote_handle_t h = get_emote_handle();
                 if (!h) return;

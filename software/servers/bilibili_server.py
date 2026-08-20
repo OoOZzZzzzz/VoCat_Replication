@@ -564,54 +564,218 @@ def get_bili_audio_url(bvid):
 # JPEG/MJPEG 生成器
 # ============================================================
 
-def mjpeg_generator(bvid):
+# def mjpeg_generator(bvid):
 
+#     ffmpeg_process = None
+
+#     try:
+
+#         if not os.path.isfile(
+#             FFMPEG_EXE
+#         ):
+#             raise RuntimeError(
+#                 "FFmpeg not found: "
+#                 + FFMPEG_EXE
+#             )
+
+#         source_url = get_bili_play_url(
+#             bvid
+#         )
+
+#         log(
+#             f"[PLAY] {bvid} "
+#             "source url acquired"
+#         )
+
+#         ffmpeg_cmd = [
+#             FFMPEG_EXE,
+
+#             "-hide_banner",
+#             "-loglevel",
+#             "error",
+
+#             "-headers",
+#             (
+#                 "User-Agent: "
+#                 + session.headers["User-Agent"]
+#                 + "\r\n"
+#                 "Referer: "
+#                 + BILI_HOME
+#                 + "\r\n"
+#             ),
+
+#             # Read the DASH source at its native wall-clock rate. Without -re
+#             # FFmpeg can burst frames into the pipe, making the ESP32 appear to
+#             # play too fast and then stall.
+#             "-re",
+#             "-i",
+#             source_url,
+
+#             # Fixed 10 FPS output for the ESP32 player.
+#             "-vf",
+#             (
+#                 "fps=6,"
+#                 "scale=320:176:"
+#                 "force_original_aspect_ratio=decrease,"
+#                 "pad=320:176:"
+#                 "(320-iw)/2:"
+#                 "(176-ih)/2"
+#             ),
+
+#             # JPEG质量
+#             "-q:v",
+#             "12",
+
+#             "-f",
+#             "mjpeg",
+
+#             "pipe:1",
+#         ]
+
+#         log(
+#             "[PLAY] starting FFmpeg"
+#         )
+
+#         ffmpeg_process = subprocess.Popen(
+#             ffmpeg_cmd,
+#             stdout=subprocess.PIPE,
+#             stderr=subprocess.DEVNULL,
+#             bufsize=0,
+#         )
+
+#         buffer = bytearray()
+#         frame_count = 0
+
+#         while True:
+
+#             chunk = (
+#                 ffmpeg_process.stdout.read(
+#                     16 * 1024
+#                 )
+#             )
+
+#             if not chunk:
+#                 break
+
+#             buffer.extend(chunk)
+
+#             while True:
+
+#                 start = buffer.find(
+#                     b"\xff\xd8"
+#                 )
+
+#                 if start < 0:
+
+#                     if len(buffer) > 1024 * 1024:
+#                         buffer.clear()
+
+#                     break
+
+#                 end = buffer.find(
+#                     b"\xff\xd9",
+#                     start + 2,
+#                 )
+
+#                 if end < 0:
+
+#                     if start > 0:
+#                         del buffer[:start]
+
+#                     break
+
+#                 jpeg = bytes(
+#                     buffer[
+#                         start:end + 2
+#                     ]
+#                 )
+
+#                 del buffer[
+#                     :end + 2
+#                 ]
+
+#                 frame_count += 1
+
+#                 if frame_count <= 3:
+#                     log(
+#                         f"[PLAY] JPEG "
+#                         f"{len(jpeg)} bytes"
+#                     )
+#                 elif frame_count % 30 == 0:
+#                     log(
+#                         f"[PLAY] frames="
+#                         f"{frame_count}"
+#                     )
+
+#                 yield jpeg
+
+#     except GeneratorExit:
+
+#         log(
+#             f"[PLAY] {bvid} "
+#             "client disconnected"
+#         )
+
+#     except Exception as e:
+
+#         log(
+#             f"[PLAY] {bvid} "
+#             f"exception: {e}"
+#         )
+
+#     finally:
+
+#         if ffmpeg_process is not None:
+
+#             try:
+
+#                 if (
+#                     ffmpeg_process.poll()
+#                     is None
+#                 ):
+#                     log(
+#                         "[PLAY] terminate FFmpeg"
+#                     )
+
+#                     ffmpeg_process.terminate()
+
+#                     try:
+#                         ffmpeg_process.wait(
+#                             timeout=2
+#                         )
+
+#                     except subprocess.TimeoutExpired:
+#                         ffmpeg_process.kill()
+
+#             except Exception as e:
+
+#                 log(
+#                     f"[PLAY] cleanup error: {e}"
+#                 )
+def mjpeg_generator(bvid):
     ffmpeg_process = None
+    frame_count = 0
+    last_log_time = time.time()
+    read_blocks = 0
 
     try:
+        if not os.path.isfile(FFMPEG_EXE):
+            raise RuntimeError("FFmpeg not found: " + FFMPEG_EXE)
 
-        if not os.path.isfile(
-            FFMPEG_EXE
-        ):
-            raise RuntimeError(
-                "FFmpeg not found: "
-                + FFMPEG_EXE
-            )
-
-        source_url = get_bili_play_url(
-            bvid
-        )
-
-        log(
-            f"[PLAY] {bvid} "
-            "source url acquired"
-        )
+        source_url = get_bili_play_url(bvid)
+        log(f"[PLAY] {bvid} source url acquired")
 
         ffmpeg_cmd = [
             FFMPEG_EXE,
-
             "-hide_banner",
-            "-loglevel",
-            "error",
-
+            "-loglevel", "error",
             "-headers",
             (
-                "User-Agent: "
-                + session.headers["User-Agent"]
-                + "\r\n"
-                "Referer: "
-                + BILI_HOME
-                + "\r\n"
+                "User-Agent: " + session.headers["User-Agent"] + "\r\n"
+                "Referer: " + BILI_HOME + "\r\n"
             ),
-
-            # Read the DASH source at its native wall-clock rate. Without -re
-            # FFmpeg can burst frames into the pipe, making the ESP32 appear to
-            # play too fast and then stall.
             "-re",
-            "-i",
-            source_url,
-
-            # Fixed 10 FPS output for the ESP32 player.
+            "-i", source_url,
             "-vf",
             (
                 "fps=10,"
@@ -621,21 +785,12 @@ def mjpeg_generator(bvid):
                 "(320-iw)/2:"
                 "(176-ih)/2"
             ),
-
-            # JPEG质量
-            "-q:v",
-            "7",
-
-            "-f",
-            "mjpeg",
-
+            "-q:v", "7",
+            "-f", "mjpeg",
             "pipe:1",
         ]
 
-        log(
-            "[PLAY] starting FFmpeg"
-        )
-
+        log("[PLAY] starting FFmpeg")
         ffmpeg_process = subprocess.Popen(
             ffmpeg_cmd,
             stdout=subprocess.PIPE,
@@ -647,119 +802,171 @@ def mjpeg_generator(bvid):
         frame_count = 0
 
         while True:
+            # ---- 新增：记录 read() 耗时 ----
+            read_start = time.time()
+            chunk = ffmpeg_process.stdout.read(16 * 1024)
+            read_end = time.time()
+            read_elapsed = read_end - read_start
+            if read_elapsed > 0.2:
+                print(f"[PC Perf] ffmpeg.stdout.read blocked {read_elapsed:.3f}s")
 
-            chunk = (
-                ffmpeg_process.stdout.read(
-                    16 * 1024
-                )
-            )
-
-            if not chunk:
+            # 检查进程状态
+            if ffmpeg_process.poll() is not None:
+                print(f"[PC Error] FFmpeg process exited with code {ffmpeg_process.returncode}")
                 break
 
+            if not chunk:
+                if ffmpeg_process.poll() is None:
+                    # 可能暂时无数据，等待一下
+                    time.sleep(0.01)
+                    continue
+                else:
+                    break
+
             buffer.extend(chunk)
+            read_blocks += 1
+            if read_blocks % 10 == 0:
+                print(f"[PC Perf] read blocks={read_blocks}, buffer size={len(buffer)}")
 
             while True:
-
-                start = buffer.find(
-                    b"\xff\xd8"
-                )
-
+                start = buffer.find(b"\xff\xd8")
                 if start < 0:
-
                     if len(buffer) > 1024 * 1024:
                         buffer.clear()
-
                     break
 
-                end = buffer.find(
-                    b"\xff\xd9",
-                    start + 2,
-                )
-
+                end = buffer.find(b"\xff\xd9", start + 2)
                 if end < 0:
-
                     if start > 0:
                         del buffer[:start]
-
                     break
 
-                jpeg = bytes(
-                    buffer[
-                        start:end + 2
-                    ]
-                )
-
-                del buffer[
-                    :end + 2
-                ]
+                jpeg = bytes(buffer[start:end + 2])
+                del buffer[:end + 2]
 
                 frame_count += 1
+                now = time.time()
 
-                if frame_count <= 3:
-                    log(
-                        f"[PLAY] JPEG "
-                        f"{len(jpeg)} bytes"
-                    )
-                elif frame_count % 30 == 0:
-                    log(
-                        f"[PLAY] frames="
-                        f"{frame_count}"
-                    )
+                # ---- 新增：每5帧打印帧间隔 ----
+                if frame_count % 5 == 0:
+                    interval = now - last_log_time
+                    print(f"[PC Perf] Frame {frame_count}, interval since last log: {interval:.3f}s (avg {interval/5:.3f}s/frame)")
+                    last_log_time = now
 
+                # ---- 新增：记录 yield 阻塞 ----
+                yield_start = time.time()
                 yield jpeg
+                yield_end = time.time()
+                yield_elapsed = yield_end - yield_start
+                if yield_elapsed > 0.1:
+                    print(f"[PC Perf] yield jpeg blocked {yield_elapsed:.3f}s (client may be slow)")
 
     except GeneratorExit:
-
-        log(
-            f"[PLAY] {bvid} "
-            "client disconnected"
-        )
-
+        log(f"[PLAY] {bvid} client disconnected")
     except Exception as e:
-
-        log(
-            f"[PLAY] {bvid} "
-            f"exception: {e}"
-        )
-
+        log(f"[PLAY] {bvid} exception: {e}")
     finally:
-
         if ffmpeg_process is not None:
-
             try:
-
-                if (
-                    ffmpeg_process.poll()
-                    is None
-                ):
-                    log(
-                        "[PLAY] terminate FFmpeg"
-                    )
-
+                if ffmpeg_process.poll() is None:
+                    log("[PLAY] terminate FFmpeg")
                     ffmpeg_process.terminate()
-
                     try:
-                        ffmpeg_process.wait(
-                            timeout=2
-                        )
-
+                        ffmpeg_process.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         ffmpeg_process.kill()
-
             except Exception as e:
-
-                log(
-                    f"[PLAY] cleanup error: {e}"
-                )
-
+                log(f"[PLAY] cleanup error: {e}")
 
 # ============================================================
 # PCM audio generator
 # ============================================================
 
+# def pcm_audio_generator(bvid):
+#     ffmpeg_process = None
+
+#     try:
+#         if not os.path.isfile(FFMPEG_EXE):
+#             raise RuntimeError("FFmpeg not found: " + FFMPEG_EXE)
+
+#         source_url = get_bili_audio_url(bvid)
+#         log(f"[AUDIO] {bvid} source url acquired")
+
+#         ffmpeg_cmd = [
+#             FFMPEG_EXE,
+#             "-hide_banner",
+#             "-loglevel", "error",
+#             "-headers",
+#             (
+#                 "User-Agent: " + session.headers["User-Agent"] + "\r\n"
+#                 "Referer: " + BILI_HOME + "\r\n"
+#             ),
+#             "-re",
+#             "-i", source_url,
+#             "-vn",
+#             "-af", "aresample=async=1:first_pts=0",
+#             "-ac", "1",
+#             "-ar", "24000",
+#             "-c:a", "pcm_s16le",
+#             "-f", "s16le",
+#             "-flush_packets", "1",
+#             "pipe:1",
+#         ]
+
+#         log("[AUDIO] starting FFmpeg")
+#         ffmpeg_process = subprocess.Popen(
+#             ffmpeg_cmd,
+#             stdout=subprocess.PIPE,
+#             stderr=subprocess.DEVNULL,
+#             bufsize=0,
+#         )
+
+#         chunk_count = 0
+#         pending = bytearray()
+#         target_bytes = 2400 * 2  # 100 ms @ 24 kHz / 16-bit / mono
+
+#         while True:
+#             raw = ffmpeg_process.stdout.read(8192)
+#             if not raw:
+#                 break
+
+#             pending.extend(raw)
+
+#             while len(pending) >= target_bytes:
+#                 packet = bytes(pending[:target_bytes])
+#                 del pending[:target_bytes]
+
+#                 chunk_count += 1
+#                 if chunk_count <= 2 or chunk_count % 30 == 0:
+#                     log(
+#                         f"[AUDIO] PCM bytes={len(packet)} "
+#                         f"chunks={chunk_count}"
+#                     )
+#                 yield packet
+
+#         # Ignore a final partial packet. It is not a full 100 ms media block
+#         # and feeding it would introduce a timing discontinuity.
+
+#     except GeneratorExit:
+#         log(f"[AUDIO] {bvid} client disconnected")
+#     except Exception as e:
+#         log(f"[AUDIO] {bvid} exception: {e}")
+#     finally:
+#         if ffmpeg_process is not None:
+#             try:
+#                 if ffmpeg_process.poll() is None:
+#                     ffmpeg_process.terminate()
+#                     try:
+#                         ffmpeg_process.wait(timeout=2)
+#                     except subprocess.TimeoutExpired:
+#                         ffmpeg_process.kill()
+#             except Exception as e:
+#                 log(f"[AUDIO] cleanup error: {e}")
+
 def pcm_audio_generator(bvid):
     ffmpeg_process = None
+    chunk_count = 0
+    last_log_time = time.time()
 
     try:
         if not os.path.isfile(FFMPEG_EXE):
@@ -797,14 +1004,25 @@ def pcm_audio_generator(bvid):
             bufsize=0,
         )
 
-        chunk_count = 0
         pending = bytearray()
-        target_bytes = 2400 * 2  # 100 ms @ 24 kHz / 16-bit / mono
+        target_bytes = 2400 * 2
 
         while True:
+            # ---- 记录 ffmpeg.stdout.read 耗时 ----
+            read_start = time.time()
             raw = ffmpeg_process.stdout.read(8192)
-            if not raw:
+            read_end = time.time()
+            read_elapsed = read_end - read_start
+            if read_elapsed > 0.2:
+                print(f"[PC Perf Audio] ffmpeg.read blocked {read_elapsed:.3f}s")
+
+            if ffmpeg_process.poll() is not None:
+                print(f"[PC Error Audio] FFmpeg exited with code {ffmpeg_process.returncode}")
                 break
+
+            if not raw:
+                time.sleep(0.01)
+                continue
 
             pending.extend(raw)
 
@@ -813,15 +1031,21 @@ def pcm_audio_generator(bvid):
                 del pending[:target_bytes]
 
                 chunk_count += 1
-                if chunk_count <= 2 or chunk_count % 30 == 0:
-                    log(
-                        f"[AUDIO] PCM bytes={len(packet)} "
-                        f"chunks={chunk_count}"
-                    )
-                yield packet
+                now = time.time()
 
-        # Ignore a final partial packet. It is not a full 100 ms media block
-        # and feeding it would introduce a timing discontinuity.
+                # ---- 每10个块打印间隔 ----
+                if chunk_count % 10 == 0:
+                    interval = now - last_log_time
+                    print(f"[PC Perf Audio] chunk {chunk_count}, interval {interval:.3f}s (avg {interval/10:.3f}s)")
+                    last_log_time = now
+
+                # ---- 记录 yield 阻塞 ----
+                yield_start = time.time()
+                yield packet
+                yield_end = time.time()
+                yield_elapsed = yield_end - yield_start
+                if yield_elapsed > 0.1:
+                    print(f"[PC Perf Audio] yield blocked {yield_elapsed:.3f}s")
 
     except GeneratorExit:
         log(f"[AUDIO] {bvid} client disconnected")
@@ -838,7 +1062,6 @@ def pcm_audio_generator(bvid):
                         ffmpeg_process.kill()
             except Exception as e:
                 log(f"[AUDIO] cleanup error: {e}")
-
 
 # ============================================================
 # /bili/audio

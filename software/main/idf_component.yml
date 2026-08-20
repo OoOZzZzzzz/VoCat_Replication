@@ -63,6 +63,10 @@ dependencies:
     public: true
     version: '*'
 
+  # espressif/esp_player: ^1.0.0
+  # espressif/esp_video_render: ^1.0.0
+  # espressif/esp_audio_render: ^1.0.0
+
   ## Required IDF version
   idf:
     version: '>=5.5.2'

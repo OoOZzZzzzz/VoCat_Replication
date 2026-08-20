@@ -23,6 +23,16 @@
 #include "display/lvgl_display/jpg/jpeg_to_image.h"
 #include "audio_service.h"
 
+#define debug_
+#ifdef debug_
+
+#include "esp_timer.h"
+#define LOG_TIME_MS() (esp_timer_get_time() / 1000)
+#define TAG_BLOCK "BLOCK"
+#define TAG_PERF "PERF"
+
+#endif
+
 #define TAG "BILI_UI"
 #define BILI_TASK_STACK_SIZE (12 * 1024)
 #define BILI_PLAYER_STACK_SIZE (16 * 1024)
@@ -211,8 +221,19 @@ static void schedule_pending_frame_update()
         emote_handle_t h = get_emote_handle();
         if (h && idx >= 0 && s.active && s.player && !s.stop_player) {
             emote_lock(h);
+            #ifdef debug_
+            int64_t ui_start = LOG_TIME_MS();
             gfx_img_set_src(s.video_img, &s.frame_dsc[idx]);
             emote_notify_all_refresh(h);
+            int64_t ui_end = LOG_TIME_MS();
+            ESP_LOGI(TAG_PERF, "[UI] gfx update took %lld ms", ui_end - ui_start);
+            if (ui_end - ui_start > 50) {
+                ESP_LOGW(TAG_PERF, "[UI] gfx update SLOW >50ms");
+            }
+            #else
+            gfx_img_set_src(s.video_img, &s.frame_dsc[idx]);
+            emote_notify_all_refresh(h);
+            #endif
             emote_unlock(h);
 
             portENTER_CRITICAL(&s.frame_mux);
@@ -500,7 +521,20 @@ static void audio_task(void*)
     auto& audio = Application::GetInstance().GetAudioService();
 
     while (!s.stop_audio && s.active && s.player) {
+
+        #ifdef debug_
+        int64_t t_before = LOG_TIME_MS();
         int n = esp_http_client_read(client, reinterpret_cast<char*>(rx), 8192);
+        int64_t t_after = LOG_TIME_MS();
+        if (t_after - t_before > 20) {
+            ESP_LOGW(TAG_BLOCK, "[Audio] http_read blocked %lld ms, got %d bytes", t_after - t_before, n);
+        }
+        if (n == 0) {
+            ESP_LOGW(TAG_BLOCK, "[Audio] http_read returned 0, stream may end");
+        }
+        #else
+        int n = esp_http_client_read(client, reinterpret_cast<char*>(rx), 8192);
+        #endif
 
         if (n < 0) {
             if (n == -ESP_ERR_HTTP_EAGAIN) {
@@ -638,6 +672,12 @@ static bool decode_and_publish(const uint8_t *jpeg, int jpeg_len)
     // If all buffers are busy, drop this frame instead of accumulating latency.
     const int next = acquire_decode_buffer();
     if (next < 0) {
+        #ifdef debug_
+        static int drop_cnt = 0;
+        if (++drop_cnt % 10 == 0) {   // 每丢10帧打印一次，避免刷屏
+            ESP_LOGW(TAG_PERF, "[Decode] Buffer exhausted, dropped %d frames total", drop_cnt);
+        }
+        #endif
         return false;
     }
 
@@ -650,6 +690,15 @@ static bool decode_and_publish(const uint8_t *jpeg, int jpeg_len)
     size_t height = 0;
     size_t stride = 0;
 
+    #ifdef debug_
+    int64_t t_jpg_start = LOG_TIME_MS();
+    esp_err_t ret = jpeg_to_image(jpeg, static_cast<size_t>(jpeg_len), &decoded, &decoded_len, &width, &height, &stride);
+    int64_t t_jpg_end = LOG_TIME_MS();
+    ESP_LOGI(TAG_PERF, "[Decode] jpeg_to_image took %lld ms, ret=%d", t_jpg_end - t_jpg_start, ret);
+    if (t_jpg_end - t_jpg_start > 80) {
+        ESP_LOGW(TAG_PERF, "[Decode] jpeg_to_image SLOW >80ms");
+    }
+    #else
     esp_err_t ret = jpeg_to_image(
         jpeg,
         static_cast<size_t>(jpeg_len),
@@ -659,6 +708,7 @@ static bool decode_and_publish(const uint8_t *jpeg, int jpeg_len)
         &height,
         &stride
     );
+    #endif
 
     if (ret != ESP_OK || decoded == nullptr) {
         ESP_LOGW(TAG, "[Player] jpeg_to_image failed=%d size=%d", (int)ret, jpeg_len);
@@ -683,13 +733,22 @@ static bool decode_and_publish(const uint8_t *jpeg, int jpeg_len)
     uint16_t *dst =
         reinterpret_cast<uint16_t *>(out);
 
-    for (size_t i = 0; i < pixel_count; ++i) {
-        const uint16_t v = src[i];
-        dst[i] = static_cast<uint16_t>(
-            static_cast<uint16_t>(v << 8) |
-            static_cast<uint16_t>(v >> 8)
-        );
+    // for (size_t i = 0; i < pixel_count; ++i) {
+    //     const uint16_t v = src[i];
+    //     dst[i] = static_cast<uint16_t>(
+    //         static_cast<uint16_t>(v << 8) |
+    //         static_cast<uint16_t>(v >> 8)
+    //     );
+    // }
+
+    uint32_t *src32 = (uint32_t*)src;
+    uint32_t *dst32 = (uint32_t*)dst;
+    for (size_t i = 0; i < pixel_count / 2; ++i) {
+        uint32_t v = src32[i];
+        // 交换每个16位通道的低8位和高8位
+        dst32[i] = ((v & 0xFF00FF00) >> 8) | ((v & 0x00FF00FF) << 8);
     }
+
 
     jpeg_free_align(decoded);
 
@@ -742,7 +801,7 @@ static void player_task(void *)
     esp_http_client_config_t cfg = {};
     cfg.url = url;
     cfg.timeout_ms = 15000;
-    cfg.buffer_size = 16 * 1024;
+    cfg.buffer_size = 32 * 1024;
     cfg.buffer_size_tx = 1024;
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -804,12 +863,26 @@ static void player_task(void *)
     uint8_t rx[8192];
 
     while (!s.stop_player && s.active && s.player) {
+
+        #ifdef debug_
+        int64_t t_before = LOG_TIME_MS();
         int n = esp_http_client_read(client, reinterpret_cast<char *>(rx), sizeof(rx));
+        int64_t t_after = LOG_TIME_MS();
+        if (t_after - t_before > 20) {
+            ESP_LOGW(TAG_BLOCK, "[Player] http_read blocked %lld ms, got %d bytes", t_after - t_before, n);
+        }
+        if (n == 0) {
+            ESP_LOGW(TAG_BLOCK, "[Player] http_read returned 0, stream may end");
+        }
+        #else
+        int n = esp_http_client_read(client, reinterpret_cast<char *>(rx), sizeof(rx));
+        #endif
+
         if (n < 0) {
             // Live MJPEG is intentionally chunked. A timeout before the next
             // JPEG is not a stream failure; keep the connection alive.
             if (n == -ESP_ERR_HTTP_EAGAIN) {
-                vTaskDelay(pdMS_TO_TICKS(50));
+                vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
             ESP_LOGE(TAG, "[Player] stream read error=%d", n);
@@ -874,10 +947,21 @@ static void player_task(void *)
                  * 1500 ms. This establishes a common A/V start point without
                  * allowing a failed audio stream to block video indefinitely.
                  */
+                #ifdef debug_
+                int wait_loop = 0;
+                while (!s.audio_ready && !s.stop_player && s.active && s.player && (esp_timer_get_time() - first_frame_wait_start) < 1500000) {
+                    if (++wait_loop % 100 == 0) {
+                        int64_t elapsed = (esp_timer_get_time() - first_frame_wait_start) / 1000;
+                        ESP_LOGW(TAG_PERF, "[Player] Waiting for audio prebuffer, %lld ms elapsed", elapsed);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+                #else
                 while (!s.audio_ready && !s.stop_player && s.active && s.player &&
                        (esp_timer_get_time() - first_frame_wait_start) < 1500000) {
                     vTaskDelay(pdMS_TO_TICKS(5));
                 }
+                #endif
                 first_frame_gate = true;
             }
 

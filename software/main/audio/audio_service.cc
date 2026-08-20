@@ -189,17 +189,37 @@ void AudioService::Stop() {
 
 void AudioService::SetExternalMediaPlaybackMode(bool enable)
 {
-    if (audio_output_task_handle_ == nullptr) {
-        return;
-    }
+    external_media_playback_.store(enable);
 
-    // Native audio output normally runs at priority 4. During Bilibili playback
-    // it must not compete head-to-head with the video JPEG decoder (also priority 4).
-    // Keep a small PCM queue so output remains continuous while yielding CPU to video.
-    vTaskPrioritySet(
-        audio_output_task_handle_,
-        enable ? 2 : 4
-    );
+    if (enable) {
+        ESP_LOGI(TAG, "Entering external media playback mode");
+
+        // Stop all microphone/AFE/WakeWord activity. This is intentionally
+        // signaled to AudioInputTask instead of toggling ADC from this task.
+        xEventGroupClearBits(
+            event_group_,
+            AS_EVENT_WAKE_WORD_RUNNING |
+            AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+            AS_EVENT_AUDIO_TESTING_RUNNING
+        );
+        xEventGroupSetBits(
+            event_group_,
+            AS_EVENT_AUDIO_INPUT_STOP_REQUEST
+        );
+
+        // Drop any pending cloud TTS/Opus audio so Bilibili owns the speaker.
+        ResetDecoder();
+
+        // Keep PCM output responsive but give the video decoder more CPU.
+        if (audio_output_task_handle_ != nullptr) {
+            vTaskPrioritySet(audio_output_task_handle_, 3);
+        }
+    } else {
+        ESP_LOGI(TAG, "Leaving external media playback mode");
+        if (audio_output_task_handle_ != nullptr) {
+            vTaskPrioritySet(audio_output_task_handle_, 4);
+        }
+    }
 }
 
 bool AudioService::PushPcmToPlaybackQueue(const int16_t* pcm, size_t samples, int sample_rate)
@@ -302,6 +322,20 @@ void AudioService::AudioInputTask() {
                 codec_->EnableInput(false);
             }
             break;
+        }
+
+        if (external_media_playback_.load()) {
+            if (codec_->input_enabled()) {
+                codec_->EnableInput(false);
+            }
+            xEventGroupClearBits(
+                event_group_,
+                AS_EVENT_WAKE_WORD_RUNNING |
+                AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                AS_EVENT_AUDIO_TESTING_RUNNING
+            );
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
         }
 
         if (bits & AS_EVENT_AUDIO_INPUT_STOP_REQUEST) {
@@ -631,6 +665,9 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
 }
 
 bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
+    if (external_media_playback_.load()) {
+        return false;
+    }
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
         if (wait) {
@@ -682,6 +719,10 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
 }
 
 void AudioService::EnableWakeWordDetection(bool enable) {
+    if (enable && external_media_playback_.load()) {
+        ESP_LOGD(TAG, "Ignore wake word enable during external media playback");
+        return;
+    }
     ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
     if (enable) {
         if (!InitializeAudioEngine() || !audio_engine_->HasWakeWord()) {
@@ -705,6 +746,10 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 }
 
 void AudioService::EnableVoiceProcessing(bool enable) {
+    if (enable && external_media_playback_.load()) {
+        ESP_LOGD(TAG, "Ignore voice processing enable during external media playback");
+        return;
+    }
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
 
     if (enable) {
@@ -730,6 +775,10 @@ void AudioService::EnableVoiceProcessing(bool enable) {
 }
 
 void AudioService::EnableAudioTesting(bool enable) {
+    if (enable && external_media_playback_.load()) {
+        ESP_LOGD(TAG, "Ignore audio testing during external media playback");
+        return;
+    }
     ESP_LOGI(TAG, "%s audio testing", enable ? "Enabling" : "Disabling");
     if (enable) {
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);

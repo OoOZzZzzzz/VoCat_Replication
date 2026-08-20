@@ -8,6 +8,7 @@
 
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
+#include "esp_wifi.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -23,16 +24,6 @@
 #include "display/lvgl_display/jpg/jpeg_to_image.h"
 #include "audio_service.h"
 
-#define debug_
-#ifdef debug_
-
-#include "esp_timer.h"
-#define LOG_TIME_MS() (esp_timer_get_time() / 1000)
-#define TAG_BLOCK "BLOCK"
-#define TAG_PERF "PERF"
-
-#endif
-
 #define TAG "BILI_UI"
 #define BILI_TASK_STACK_SIZE (12 * 1024)
 #define BILI_PLAYER_STACK_SIZE (16 * 1024)
@@ -43,6 +34,10 @@
 #define BILI_FRAME_BUF_SIZE (BILI_VIDEO_W * BILI_VIDEO_H * 2)
 #define BILI_FRAME_BUF_COUNT 4
 #define BILI_JPEG_BUF_SIZE (96 * 1024)
+#define BILI_RX_CHUNK_SIZE (16 * 1024)
+#define BILI_JPEG_SLOT_SIZE (32 * 1024)
+#define BILI_JPEG_SLOT_COUNT 8
+#define BILI_JPEG_QUEUE_DEPTH 6
 #define BILI_PLAY_URL_BASE "http://192.168.31.106:8000/bili/play?bvid="
 #define BILI_AUDIO_URL_BASE "http://192.168.31.106:8000/bili/audio?bvid="
 #define BILI_AUDIO_SAMPLE_RATE 24000
@@ -87,7 +82,17 @@ struct State {
 
     TaskHandle_t fetch_task = nullptr;
     TaskHandle_t player_task = nullptr;
+    TaskHandle_t video_rx_task = nullptr;
     TaskHandle_t audio_task = nullptr;
+
+    QueueHandle_t jpeg_queue = nullptr;
+    uint8_t *jpeg_slots[BILI_JPEG_SLOT_COUNT] = {};
+    size_t jpeg_slot_len[BILI_JPEG_SLOT_COUNT] = {};
+    uint8_t jpeg_slot_state[BILI_JPEG_SLOT_COUNT] = {};
+    portMUX_TYPE jpeg_mux = portMUX_INITIALIZER_UNLOCKED;
+
+    bool media_mode = false;
+    wifi_ps_type_t saved_wifi_ps = WIFI_PS_MAX_MODEM;
 };
 
 static State s;
@@ -146,6 +151,103 @@ static void set_text(gfx_obj_t *o, const char *str, uint32_t color,
     gfx_obj_set_pos(o, x, y);
     gfx_obj_set_size(o, w, h);
     gfx_obj_set_visible(o, true);
+}
+
+static void enter_media_network_mode()
+{
+    if (s.media_mode) return;
+    if (esp_wifi_get_ps(&s.saved_wifi_ps) != ESP_OK) s.saved_wifi_ps = WIFI_PS_MAX_MODEM;
+    esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "[NET] WiFi PS -> NONE (%s)", esp_err_to_name(err));
+    s.media_mode = true;
+}
+
+static void maybe_leave_media_network_mode()
+{
+    if (!s.media_mode) return;
+    if (s.player_task || s.video_rx_task || s.audio_task) return;
+    Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(false);
+    esp_wifi_set_ps(s.saved_wifi_ps);
+    ESP_LOGI(TAG, "[NET] WiFi PS restored -> %d", (int)s.saved_wifi_ps);
+    s.media_mode = false;
+}
+
+static bool alloc_jpeg_slots()
+{
+    if (!s.jpeg_queue) {
+        s.jpeg_queue = xQueueCreate(BILI_JPEG_QUEUE_DEPTH, sizeof(uint8_t));
+        if (!s.jpeg_queue) return false;
+    }
+    for (int i = 0; i < BILI_JPEG_SLOT_COUNT; ++i) {
+        if (!s.jpeg_slots[i]) {
+            s.jpeg_slots[i] = static_cast<uint8_t *>(
+                heap_caps_malloc(BILI_JPEG_SLOT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (!s.jpeg_slots[i]) return false;
+        }
+        s.jpeg_slot_len[i] = 0;
+        s.jpeg_slot_state[i] = 0;
+    }
+    uint8_t idx;
+    while (xQueueReceive(s.jpeg_queue, &idx, 0) == pdTRUE) {
+        if (idx < BILI_JPEG_SLOT_COUNT) {
+            s.jpeg_slot_state[idx] = 0;
+            s.jpeg_slot_len[idx] = 0;
+        }
+    }
+    return true;
+}
+
+static int acquire_jpeg_fill_slot()
+{
+    portENTER_CRITICAL(&s.jpeg_mux);
+    for (int i = 0; i < BILI_JPEG_SLOT_COUNT; ++i) {
+        if (s.jpeg_slot_state[i] == 0) {
+            s.jpeg_slot_state[i] = 1;
+            s.jpeg_slot_len[i] = 0;
+            portEXIT_CRITICAL(&s.jpeg_mux);
+            return i;
+        }
+    }
+    portEXIT_CRITICAL(&s.jpeg_mux);
+
+    uint8_t old = 0;
+    if (xQueueReceive(s.jpeg_queue, &old, 0) == pdTRUE && old < BILI_JPEG_SLOT_COUNT) {
+        portENTER_CRITICAL(&s.jpeg_mux);
+        if (s.jpeg_slot_state[old] == 2) {
+            s.jpeg_slot_state[old] = 1;
+            s.jpeg_slot_len[old] = 0;
+            portEXIT_CRITICAL(&s.jpeg_mux);
+            return old;
+        }
+        portEXIT_CRITICAL(&s.jpeg_mux);
+    }
+    return -1;
+}
+
+static void queue_jpeg_slot(int slot)
+{
+    if (slot < 0 || slot >= BILI_JPEG_SLOT_COUNT) return;
+    uint8_t idx = static_cast<uint8_t>(slot);
+    portENTER_CRITICAL(&s.jpeg_mux);
+    s.jpeg_slot_state[slot] = 2;
+    portEXIT_CRITICAL(&s.jpeg_mux);
+
+    if (xQueueSend(s.jpeg_queue, &idx, 0) == pdTRUE) return;
+
+    uint8_t old = 0;
+    if (xQueueReceive(s.jpeg_queue, &old, 0) == pdTRUE && old < BILI_JPEG_SLOT_COUNT) {
+        portENTER_CRITICAL(&s.jpeg_mux);
+        s.jpeg_slot_state[old] = 0;
+        s.jpeg_slot_len[old] = 0;
+        portEXIT_CRITICAL(&s.jpeg_mux);
+    }
+
+    if (xQueueSend(s.jpeg_queue, &idx, 0) != pdTRUE) {
+        portENTER_CRITICAL(&s.jpeg_mux);
+        s.jpeg_slot_state[slot] = 0;
+        s.jpeg_slot_len[slot] = 0;
+        portEXIT_CRITICAL(&s.jpeg_mux);
+    }
 }
 
 static bool alloc_frame_buffers()
@@ -221,19 +323,8 @@ static void schedule_pending_frame_update()
         emote_handle_t h = get_emote_handle();
         if (h && idx >= 0 && s.active && s.player && !s.stop_player) {
             emote_lock(h);
-            #ifdef debug_
-            int64_t ui_start = LOG_TIME_MS();
             gfx_img_set_src(s.video_img, &s.frame_dsc[idx]);
             emote_notify_all_refresh(h);
-            int64_t ui_end = LOG_TIME_MS();
-            ESP_LOGI(TAG_PERF, "[UI] gfx update took %lld ms", ui_end - ui_start);
-            if (ui_end - ui_start > 50) {
-                ESP_LOGW(TAG_PERF, "[UI] gfx update SLOW >50ms");
-            }
-            #else
-            gfx_img_set_src(s.video_img, &s.frame_dsc[idx]);
-            emote_notify_all_refresh(h);
-            #endif
             emote_unlock(h);
 
             portENTER_CRITICAL(&s.frame_mux);
@@ -285,6 +376,7 @@ static bool init_ui_locked(emote_handle_t h)
     }
 
     if (!alloc_frame_buffers()) return false;
+    if (!alloc_jpeg_slots()) return false;
 
     // Full-screen opaque background.
     set_text(s.page, "", 0x202020, 0, 0, 360, 360, 0xF4F4F4, true);
@@ -440,7 +532,7 @@ static void stop_bili_audio()
     // worker may still be draining the previous chunk, but no new media
     // audio will be accepted after this point.
     Application::GetInstance().GetAudioService().ResetDecoder();
-    Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(false);
+    maybe_leave_media_network_mode();
 }
 
 static void audio_task(void*)
@@ -461,7 +553,7 @@ static void audio_task(void*)
     esp_http_client_config_t cfg = {};
     cfg.url = url;
     cfg.timeout_ms = 15000;
-    cfg.buffer_size = 8192;
+    cfg.buffer_size = 32768;
     cfg.buffer_size_tx = 1024;
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -499,7 +591,7 @@ static void audio_task(void*)
     }
 
     // IMPORTANT: keep all large buffers on heap, not on the FreeRTOS task stack.
-    uint8_t* rx = static_cast<uint8_t*>(heap_caps_malloc(8192, MALLOC_CAP_8BIT));
+    uint8_t* rx = static_cast<uint8_t*>(heap_caps_malloc(BILI_RX_CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     uint8_t* pcm_bytes = static_cast<uint8_t*>(heap_caps_malloc(BILI_AUDIO_CHUNK_BYTES, MALLOC_CAP_8BIT));
     if (!rx || !pcm_bytes) {
         ESP_LOGE(TAG, "[Audio] heap buffer allocation failed");
@@ -521,20 +613,13 @@ static void audio_task(void*)
     auto& audio = Application::GetInstance().GetAudioService();
 
     while (!s.stop_audio && s.active && s.player) {
-
-        #ifdef debug_
-        int64_t t_before = LOG_TIME_MS();
-        int n = esp_http_client_read(client, reinterpret_cast<char*>(rx), 8192);
-        int64_t t_after = LOG_TIME_MS();
-        if (t_after - t_before > 20) {
-            ESP_LOGW(TAG_BLOCK, "[Audio] http_read blocked %lld ms, got %d bytes", t_after - t_before, n);
+        const int64_t read_t0 = esp_timer_get_time();
+        int n = esp_http_client_read(client, reinterpret_cast<char*>(rx), BILI_RX_CHUNK_SIZE);
+        const int64_t read_us = esp_timer_get_time() - read_t0;
+        if (read_us > 100000) {
+            ESP_LOGW(TAG, "[BLOCK] [AudioRX] http_read blocked %lld ms, got %d",
+                     (long long)(read_us / 1000), n);
         }
-        if (n == 0) {
-            ESP_LOGW(TAG_BLOCK, "[Audio] http_read returned 0, stream may end");
-        }
-        #else
-        int n = esp_http_client_read(client, reinterpret_cast<char*>(rx), 8192);
-        #endif
 
         if (n < 0) {
             if (n == -ESP_ERR_HTTP_EAGAIN) {
@@ -638,9 +723,7 @@ static void audio_task(void*)
     esp_http_client_cleanup(client);
     ESP_LOGI(TAG, "[Audio] task exit chunks=%lu", (unsigned long)chunks);
     s.audio_task = nullptr;
-    if (s.player_task == nullptr) {
-        Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(false);
-    }
+    maybe_leave_media_network_mode();
     vTaskDelete(nullptr);
 }
 
@@ -649,7 +732,7 @@ static bool start_audio_task(int index)
     if (s.audio_task != nullptr) return true;
     s.stop_audio = false;
     BaseType_t ret = xTaskCreatePinnedToCore(
-        audio_task, "bili_audio", 6144, nullptr, 2, &s.audio_task, 0);
+        audio_task, "bili_audio", 8192, nullptr, 3, &s.audio_task, 0);
     if (ret != pdPASS) {
         s.audio_task = nullptr;
         ESP_LOGE(TAG, "[Audio] task create failed");
@@ -659,97 +742,39 @@ static bool start_audio_task(int index)
     return true;
 }
 
-static bool start_player_task(int index);
-
 static bool decode_and_publish(const uint8_t *jpeg, int jpeg_len)
 {
-    if (!jpeg || jpeg_len < 4 || jpeg_len > BILI_JPEG_BUF_SIZE ||
-        !s.player || s.stop_player) {
-        return false;
-    }
+    if (!jpeg || jpeg_len < 4 || jpeg_len > BILI_JPEG_SLOT_SIZE || !s.player || s.stop_player) return false;
 
-    // Latest-frame-wins: never let the producer block behind the UI.
-    // If all buffers are busy, drop this frame instead of accumulating latency.
     const int next = acquire_decode_buffer();
-    if (next < 0) {
-        #ifdef debug_
-        static int drop_cnt = 0;
-        if (++drop_cnt % 10 == 0) {   // 每丢10帧打印一次，避免刷屏
-            ESP_LOGW(TAG_PERF, "[Decode] Buffer exhausted, dropped %d frames total", drop_cnt);
-        }
-        #endif
-        return false;
-    }
-
+    if (next < 0) return false;
     uint8_t *out = s.frame_buf[next];
     if (!out) return false;
 
     uint8_t *decoded = nullptr;
-    size_t decoded_len = 0;
-    size_t width = 0;
-    size_t height = 0;
-    size_t stride = 0;
+    size_t decoded_len = 0, width = 0, height = 0, stride = 0;
+    const int64_t t0 = esp_timer_get_time();
+    esp_err_t ret = jpeg_to_image(jpeg, (size_t)jpeg_len, &decoded, &decoded_len, &width, &height, &stride);
+    const int64_t decode_us = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG, "[PERF] JPEG decode %lld ms", (long long)(decode_us / 1000));
 
-    #ifdef debug_
-    int64_t t_jpg_start = LOG_TIME_MS();
-    esp_err_t ret = jpeg_to_image(jpeg, static_cast<size_t>(jpeg_len), &decoded, &decoded_len, &width, &height, &stride);
-    int64_t t_jpg_end = LOG_TIME_MS();
-    ESP_LOGI(TAG_PERF, "[Decode] jpeg_to_image took %lld ms, ret=%d", t_jpg_end - t_jpg_start, ret);
-    if (t_jpg_end - t_jpg_start > 80) {
-        ESP_LOGW(TAG_PERF, "[Decode] jpeg_to_image SLOW >80ms");
-    }
-    #else
-    esp_err_t ret = jpeg_to_image(
-        jpeg,
-        static_cast<size_t>(jpeg_len),
-        &decoded,
-        &decoded_len,
-        &width,
-        &height,
-        &stride
-    );
-    #endif
-
-    if (ret != ESP_OK || decoded == nullptr) {
+    if (ret != ESP_OK || !decoded) {
         ESP_LOGW(TAG, "[Player] jpeg_to_image failed=%d size=%d", (int)ret, jpeg_len);
         return false;
     }
-
     if (width != BILI_VIDEO_W || height != BILI_VIDEO_H ||
-        stride < BILI_VIDEO_STRIDE ||
-        decoded_len < static_cast<size_t>(BILI_VIDEO_STRIDE) * BILI_VIDEO_H) {
-        ESP_LOGW(TAG,
-                 "[Player] decoded size unexpected: %zux%zu stride=%zu len=%zu",
-                 width, height, stride, decoded_len);
+        stride < BILI_VIDEO_STRIDE || decoded_len < (size_t)BILI_VIDEO_STRIDE * BILI_VIDEO_H) {
         jpeg_free_align(decoded);
         return false;
     }
 
-    const size_t pixel_count =
-        static_cast<size_t>(BILI_VIDEO_W) * BILI_VIDEO_H;
-
-    const uint16_t *src =
-        reinterpret_cast<const uint16_t *>(decoded);
-    uint16_t *dst =
-        reinterpret_cast<uint16_t *>(out);
-
-    // for (size_t i = 0; i < pixel_count; ++i) {
-    //     const uint16_t v = src[i];
-    //     dst[i] = static_cast<uint16_t>(
-    //         static_cast<uint16_t>(v << 8) |
-    //         static_cast<uint16_t>(v >> 8)
-    //     );
-    // }
-
-    uint32_t *src32 = (uint32_t*)src;
-    uint32_t *dst32 = (uint32_t*)dst;
-    for (size_t i = 0; i < pixel_count / 2; ++i) {
-        uint32_t v = src32[i];
-        // 交换每个16位通道的低8位和高8位
-        dst32[i] = ((v & 0xFF00FF00) >> 8) | ((v & 0x00FF00FF) << 8);
+    const size_t pixel_count = (size_t)BILI_VIDEO_W * BILI_VIDEO_H;
+    const uint16_t *src = reinterpret_cast<const uint16_t *>(decoded);
+    uint16_t *dst = reinterpret_cast<uint16_t *>(out);
+    for (size_t i = 0; i < pixel_count; ++i) {
+        const uint16_t v = src[i];
+        dst[i] = (uint16_t)((v << 8) | (v >> 8));
     }
-
-
     jpeg_free_align(decoded);
 
     s.frame_dsc[next].header.magic = C_ARRAY_HEADER_MAGIC;
@@ -765,263 +790,207 @@ static bool decode_and_publish(const uint8_t *jpeg, int jpeg_len)
     s.frame_dsc[next].reserved_2 = nullptr;
 
     bool need_schedule = false;
-
     portENTER_CRITICAL(&s.frame_mux);
-    // If a newer frame is already waiting, this older one should never be queued.
-    // Replacing pending_index is the latency-control mechanism.
+    if (s.pending_index >= 0) {
+        const int old = s.pending_index;
+        s.pending_index = -1;
+        (void)old;
+    }
     s.pending_index = next;
     if (!s.ui_update_scheduled) {
         s.ui_update_scheduled = true;
         need_schedule = true;
     }
     portEXIT_CRITICAL(&s.frame_mux);
-
-    if (need_schedule) {
-        schedule_pending_frame_update();
-    }
-
+    if (need_schedule) schedule_pending_frame_update();
     return true;
 }
 
-static void player_task(void *)
+static void video_decode_task(void *)
+{
+    ESP_LOGI(TAG, "[VDEC] task start");
+    uint32_t frames = 0, dropped = 0;
+    while (!s.stop_player && s.active && s.player) {
+        uint8_t slot = 0;
+        if (xQueueReceive(s.jpeg_queue, &slot, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+        if (slot >= BILI_JPEG_SLOT_COUNT) continue;
+
+        size_t len = 0;
+        portENTER_CRITICAL(&s.jpeg_mux);
+        if (s.jpeg_slot_state[slot] != 2) { portEXIT_CRITICAL(&s.jpeg_mux); continue; }
+        s.jpeg_slot_state[slot] = 3;
+        len = s.jpeg_slot_len[slot];
+        portEXIT_CRITICAL(&s.jpeg_mux);
+
+        if (!s.stop_player && s.active && s.player && len) {
+            if (decode_and_publish(s.jpeg_slots[slot], (int)len)) {
+                ++frames;
+                if (frames <= 3 || frames % 10 == 0)
+                    ESP_LOGI(TAG, "[VDEC] frame=%lu q=%u", (unsigned long)frames,
+                             (unsigned)uxQueueMessagesWaiting(s.jpeg_queue));
+            } else {
+                ++dropped;
+            }
+        }
+
+        portENTER_CRITICAL(&s.jpeg_mux);
+        s.jpeg_slot_state[slot] = 0;
+        s.jpeg_slot_len[slot] = 0;
+        portEXIT_CRITICAL(&s.jpeg_mux);
+    }
+    s.player_task = nullptr;
+    ESP_LOGI(TAG, "[VDEC] exit frames=%lu dropped=%lu", (unsigned long)frames, (unsigned long)dropped);
+    maybe_leave_media_network_mode();
+    vTaskDelete(nullptr);
+}
+
+static void video_rx_task(void *)
 {
     const int index = s.selected;
-    if (index < 0 || index >= s.count) {
-        s.player_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
+    esp_http_client_handle_t client = nullptr;
+    uint8_t *rx = nullptr;
+    int slot = -1;
+    uint32_t frames = 0, dropped = 0;
 
-    char url[320];
-    snprintf(url, sizeof(url), "%s%s", BILI_PLAY_URL_BASE, s.videos[index].bvid);
+    do {
+        if (index < 0 || index >= s.count) break;
+        if (!alloc_jpeg_slots()) break;
 
-    ESP_LOGI(TAG, "[Player] open %s", url);
-    update_player_status("正在连接视频流...");
+        char url[320];
+        snprintf(url, sizeof(url), "%s%s", BILI_PLAY_URL_BASE, s.videos[index].bvid);
+        ESP_LOGI(TAG, "[RX] open %s", url);
 
-    esp_http_client_config_t cfg = {};
-    cfg.url = url;
-    cfg.timeout_ms = 15000;
-    cfg.buffer_size = 32 * 1024;
-    cfg.buffer_size_tx = 1024;
+        esp_http_client_config_t cfg = {};
+        cfg.url = url;
+        cfg.timeout_ms = 15000;
+        cfg.buffer_size = 32768;
+        cfg.buffer_size_tx = 1024;
+        cfg.keep_alive_enable = true;
 
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) {
-        ESP_LOGE(TAG, "[Player] http init failed");
-        update_player_status("视频连接失败");
-        s.player_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
+        client = esp_http_client_init(&cfg);
+        if (!client) break;
+        if (esp_http_client_open(client, 0) != ESP_OK) break;
 
-    esp_err_t ret = esp_http_client_open(client, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[Player] open failed=%d", ret);
-        esp_http_client_cleanup(client);
-        update_player_status("视频连接失败");
-        s.player_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
+        int content_length = esp_http_client_fetch_headers(client);
+        int status = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "[RX] connected status=%d content_len=%d", status, content_length);
+        if (status != 200) break;
 
-    int64_t content_length = esp_http_client_fetch_headers(client);
-    ESP_LOGI(TAG, "[Player] connected status=%d content_len=%lld",
-             esp_http_client_get_status_code(client), content_length);
+        rx = static_cast<uint8_t *>(heap_caps_malloc(BILI_RX_CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!rx) break;
 
-    if (esp_http_client_get_status_code(client) != 200) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        update_player_status("服务器返回错误");
-        s.player_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    update_player_status("视频加载中...");
-
-    uint8_t *jpeg_buf = static_cast<uint8_t *>(
-        heap_caps_malloc(BILI_JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-    );
-    if (!jpeg_buf) {
-        jpeg_buf = static_cast<uint8_t *>(malloc(BILI_JPEG_BUF_SIZE));
-    }
-
-    if (!jpeg_buf) {
-        ESP_LOGE(TAG, "[Player] JPEG buffer alloc failed");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        update_player_status("内存不足");
-        s.player_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    int used = 0;
-    bool first_frame = true;
-    uint32_t frame_count = 0;
-    bool first_frame_gate = false;
-    const int64_t first_frame_wait_start = esp_timer_get_time();
-    uint8_t rx[8192];
-
-    while (!s.stop_player && s.active && s.player) {
-
-        #ifdef debug_
-        int64_t t_before = LOG_TIME_MS();
-        int n = esp_http_client_read(client, reinterpret_cast<char *>(rx), sizeof(rx));
-        int64_t t_after = LOG_TIME_MS();
-        if (t_after - t_before > 20) {
-            ESP_LOGW(TAG_BLOCK, "[Player] http_read blocked %lld ms, got %d bytes", t_after - t_before, n);
-        }
-        if (n == 0) {
-            ESP_LOGW(TAG_BLOCK, "[Player] http_read returned 0, stream may end");
-        }
-        #else
-        int n = esp_http_client_read(client, reinterpret_cast<char *>(rx), sizeof(rx));
-        #endif
-
-        if (n < 0) {
-            // Live MJPEG is intentionally chunked. A timeout before the next
-            // JPEG is not a stream failure; keep the connection alive.
-            if (n == -ESP_ERR_HTTP_EAGAIN) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-            ESP_LOGE(TAG, "[Player] stream read error=%d", n);
-            update_player_status("视频流读取失败");
-            break;
-        }
-
-        if (n == 0) {
-            if (esp_http_client_is_complete_data_received(client)) {
-                ESP_LOGI(TAG, "[Player] stream ended");
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        if (used + n > BILI_JPEG_BUF_SIZE) {
-            ESP_LOGW(TAG, "[Player] JPEG buffer overflow, reset parser");
-            used = 0;
-        }
-
-        memcpy(jpeg_buf + used, rx, n);
-        used += n;
+        slot = acquire_jpeg_fill_slot();
+        if (slot < 0) break;
+        size_t used = 0;
+        bool in_frame = false;
+        bool prev_ff = false;
 
         while (!s.stop_player && s.active && s.player) {
-            int start = -1;
-            for (int i = 0; i + 1 < used; ++i) {
-                if (jpeg_buf[i] == 0xFF && jpeg_buf[i + 1] == 0xD8) {
-                    start = i;
-                    break;
-                }
+            const int64_t t0 = esp_timer_get_time();
+            int n = esp_http_client_read(client, reinterpret_cast<char *>(rx), BILI_RX_CHUNK_SIZE);
+            const int64_t wait_us = esp_timer_get_time() - t0;
+            if (wait_us > 100000) {
+                ESP_LOGW(TAG, "[BLOCK] VideoRX read=%lldms n=%d q=%u", (long long)(wait_us/1000), n,
+                         (unsigned)uxQueueMessagesWaiting(s.jpeg_queue));
             }
-
-            if (start < 0) {
-                if (used > 1) {
-                    jpeg_buf[0] = jpeg_buf[used - 1];
-                    used = 1;
-                }
+            if (n < 0) {
+                if (n == -ESP_ERR_HTTP_EAGAIN) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
                 break;
             }
-
-            if (start > 0) {
-                memmove(jpeg_buf, jpeg_buf + start, used - start);
-                used -= start;
+            if (n == 0) {
+                if (esp_http_client_is_complete_data_received(client)) break;
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue;
             }
 
-            int end = -1;
-            for (int i = 2; i + 1 < used; ++i) {
-                if (jpeg_buf[i] == 0xFF && jpeg_buf[i + 1] == 0xD9) {
-                    end = i + 1;
-                    break;
-                }
-            }
-
-            if (end < 0) break;
-
-            int frame_len = end + 1;
-
-            if (!first_frame_gate) {
-                /*
-                 * Wait for the audio prebuffer, but never wait longer than
-                 * 1500 ms. This establishes a common A/V start point without
-                 * allowing a failed audio stream to block video indefinitely.
-                 */
-                #ifdef debug_
-                int wait_loop = 0;
-                while (!s.audio_ready && !s.stop_player && s.active && s.player && (esp_timer_get_time() - first_frame_wait_start) < 1500000) {
-                    if (++wait_loop % 100 == 0) {
-                        int64_t elapsed = (esp_timer_get_time() - first_frame_wait_start) / 1000;
-                        ESP_LOGW(TAG_PERF, "[Player] Waiting for audio prebuffer, %lld ms elapsed", elapsed);
+            for (int i = 0; i < n; ++i) {
+                const uint8_t b = rx[i];
+                if (!in_frame) {
+                    if (prev_ff && b == 0xD8) {
+                        slot = acquire_jpeg_fill_slot();
+                        if (slot < 0) { ++dropped; prev_ff = false; continue; }
+                        used = 0;
+                        s.jpeg_slots[slot][used++] = 0xFF;
+                        s.jpeg_slots[slot][used++] = 0xD8;
+                        in_frame = true;
+                        prev_ff = false;
+                        continue;
                     }
-                    vTaskDelay(pdMS_TO_TICKS(5));
+                    prev_ff = (b == 0xFF);
+                    continue;
                 }
-                #else
-                while (!s.audio_ready && !s.stop_player && s.active && s.player &&
-                       (esp_timer_get_time() - first_frame_wait_start) < 1500000) {
-                    vTaskDelay(pdMS_TO_TICKS(5));
-                }
-                #endif
-                first_frame_gate = true;
-            }
 
-            if (decode_and_publish(jpeg_buf, frame_len)) {
-                ++frame_count;
-                if (frame_count <= 3 || (frame_count % 10) == 0) {
-                    ESP_LOGI(TAG, "[Player] frame=%lu", (unsigned long)frame_count);
+                if (used >= BILI_JPEG_SLOT_SIZE) {
+                    portENTER_CRITICAL(&s.jpeg_mux);
+                    s.jpeg_slot_state[slot] = 0;
+                    s.jpeg_slot_len[slot] = 0;
+                    portEXIT_CRITICAL(&s.jpeg_mux);
+                    ++dropped;
+                    in_frame = false;
+                    prev_ff = (b == 0xFF);
+                    slot = -1;
+                    continue;
                 }
-                if (first_frame) {
-                    first_frame = false;
-                    update_player_status("");
+                s.jpeg_slots[slot][used++] = b;
+                if (prev_ff && b == 0xD9) {
+                    s.jpeg_slot_len[slot] = used;
+                    queue_jpeg_slot(slot);
+                    ++frames;
+                    if (frames <= 3 || frames % 30 == 0)
+                        ESP_LOGI(TAG, "[RX] queued=%lu q=%u dropped=%lu", (unsigned long)frames,
+                                 (unsigned)uxQueueMessagesWaiting(s.jpeg_queue), (unsigned long)dropped);
+                    in_frame = false;
+                    prev_ff = false;
+                    slot = -1;
+                    continue;
                 }
+                prev_ff = (b == 0xFF);
             }
-
-            if (frame_len < used) {
-                memmove(jpeg_buf, jpeg_buf + frame_len, used - frame_len);
-                used -= frame_len;
-            } else {
-                used = 0;
-            }
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
-    }
+    } while (false);
 
-    free(jpeg_buf);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-
-    ESP_LOGI(TAG, "[Player] task exit");
-    s.player_task = nullptr;
-    if (s.audio_task == nullptr) {
-        Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(false);
+    if (slot >= 0 && slot < BILI_JPEG_SLOT_COUNT) {
+        portENTER_CRITICAL(&s.jpeg_mux);
+        if (s.jpeg_slot_state[slot] == 1) {
+            s.jpeg_slot_state[slot] = 0;
+            s.jpeg_slot_len[slot] = 0;
+        }
+        portEXIT_CRITICAL(&s.jpeg_mux);
     }
+    if (rx) heap_caps_free(rx);
+    if (client) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+    }
+    s.stop_player = true;
+    s.stop_audio = true;
+    Application::GetInstance().GetAudioService().ResetDecoder();
+    s.video_rx_task = nullptr;
+    ESP_LOGI(TAG, "[RX] exit frames=%lu dropped=%lu", (unsigned long)frames, (unsigned long)dropped);
+    maybe_leave_media_network_mode();
     vTaskDelete(nullptr);
 }
 
 static bool start_player_task(int index)
 {
-    if (s.player_task != nullptr) return true;
-
+    if (s.player_task || s.video_rx_task) return true;
+    enter_media_network_mode();
     s.selected = index;
     s.stop_player = false;
     s.stop_audio = false;
+    if (!alloc_jpeg_slots()) return false;
 
     BaseType_t ret = xTaskCreatePinnedToCore(
-        player_task,
-        "bili_player",
-        BILI_PLAYER_STACK_SIZE,
-        nullptr,
-        4,
-        &s.player_task,
-        1
-    );
+        video_decode_task, "bili_vdec", BILI_PLAYER_STACK_SIZE,
+        nullptr, 5, &s.player_task, 1);
+    if (ret != pdPASS) { s.player_task = nullptr; return false; }
 
-    if (ret != pdPASS) {
-        s.player_task = nullptr;
-        ESP_LOGE(TAG, "[Player] task create failed");
-        return false;
-    }
-
-    ESP_LOGI(TAG, "[Player] task created index=%d", index);
+    ret = xTaskCreatePinnedToCore(
+        video_rx_task, "bili_vrx", 10 * 1024,
+        nullptr, 8, &s.video_rx_task, 1);
+    if (ret != pdPASS) { s.video_rx_task = nullptr; s.stop_player = true; return false; }
+    ESP_LOGI(TAG, "[Player] RX/Decode pipeline started index=%d", index);
     return true;
 }
 

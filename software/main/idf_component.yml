@@ -66,6 +66,7 @@ dependencies:
   # espressif/esp_player: ^1.0.0
   # espressif/esp_video_render: ^1.0.0
   # espressif/esp_audio_render: ^1.0.0
+  espressif/esp_h264: ^1.3.6
 
   ## Required IDF version
   idf:

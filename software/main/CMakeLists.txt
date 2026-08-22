@@ -43,6 +43,7 @@ set(SOURCES "audio/audio_codec.cc"
 
             "custom/vocat_bilibili.c"
             "custom/vocat_bilibili_ui.cpp"
+            "custom/bili_h264_player.cpp"
             )
 
 set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "custom")

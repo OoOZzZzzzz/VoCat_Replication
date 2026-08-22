@@ -19,4 +19,6 @@ main/mmap_generate_emoji.h
 mmap_generate_*.h
 .clangd
 
-servers/bili_cache.json
+main/custom/servers/bili_cache.json
+main/custom/servers/vbilibili_server.py
+bili_cache.json

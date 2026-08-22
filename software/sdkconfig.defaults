@@ -79,3 +79,13 @@ CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LV_BUILD_DEMOS=n
 
 CONFIG_MMAP_FILE_NAME_LENGTH=32
+
+# VoCat Bilibili media transport
+# Apply once with menuconfig/save or merge into sdkconfig.defaults.
+# CONFIG_LWIP_SO_RCVBUF=y
+# CONFIG_LWIP_WND_SCALE=y
+# 16 KiB per TCP stream: large enough for multiple JPEG/PCM packets,
+# materially above the 5760-byte default, while avoiding a 64 KiB-per-stream jump.
+# CONFIG_LWIP_TCP_WND_DEFAULT=16384
+# CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+# CONFIG_LWIP_TCP_RECVMBOX_SIZE=14

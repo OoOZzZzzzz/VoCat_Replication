@@ -1,51 +1,51 @@
 #include "vocat_bilibili_ui.hpp"
 
+#include <algorithm>
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
 #include <string>
-#include <vector>
-
-#include "esp_http_client.h"
-#include "esp_heap_caps.h"
-#include "esp_wifi.h"
-#include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
 
 #include "application.h"
+#include "audio_service.h"
 #include "board.h"
 #include "display/emote_display.h"
 #include "expression_emote.h"
 #include "gfx.h"
-#include "esp_jpeg_dec.h"
-#include "esp_jpeg_common.h"
-#include "display/lvgl_display/jpg/jpeg_to_image.h"
-#include "audio_service.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "bili_h264_player.h"
 
 #define TAG "BILI_UI"
-#define BILI_TASK_STACK_SIZE (12 * 1024)
-#define BILI_PLAYER_STACK_SIZE (16 * 1024)
+#define BILI_TASK_STACK_SIZE (10 * 1024)
 #define BILI_ROW_COUNT BILI_RECORD_MAX
+
+#define UI_W 360
+#define UI_H 360
 #define BILI_VIDEO_W 320
 #define BILI_VIDEO_H 176
-#define BILI_VIDEO_STRIDE (BILI_VIDEO_W * 2)
-#define BILI_FRAME_BUF_SIZE (BILI_VIDEO_W * BILI_VIDEO_H * 2)
-#define BILI_FRAME_BUF_COUNT 4
-#define BILI_JPEG_BUF_SIZE (96 * 1024)
-#define BILI_RX_CHUNK_SIZE (16 * 1024)
-#define BILI_JPEG_SLOT_SIZE (32 * 1024)
-#define BILI_JPEG_SLOT_COUNT 8
-#define BILI_JPEG_QUEUE_DEPTH 6
-#define BILI_PLAY_URL_BASE "http://192.168.31.106:8000/bili/play?bvid="
-#define BILI_AUDIO_URL_BASE "http://192.168.31.106:8000/bili/audio?bvid="
-#define BILI_AUDIO_SAMPLE_RATE 24000
-#define BILI_AUDIO_CHUNK_SAMPLES 2400
-#define BILI_AUDIO_PREBUFFER_CHUNKS 2
-#define BILI_AUDIO_CHUNK_BYTES (BILI_AUDIO_CHUNK_SAMPLES * sizeof(int16_t))
+#define BILI_FRAME_BYTES (BILI_VIDEO_W * BILI_VIDEO_H * 2)
+
+// Coordinates intentionally remain in the positions already confirmed correct.
+#define PLAYER_BACK_X 159
+#define PLAYER_BACK_Y 8
+#define PLAYER_BACK_SIZE 42
+#define PLAYER_X 20
+#define PLAYER_Y 70
+#define PLAYER_TITLE_Y 254
+#define PLAYER_STATUS_Y 308
+
+#define LIST_START_Y 72
+#define LIST_ROW_H 62
+#define LIST_ROW_GAP 6
+#define LIST_ROW_X 24
+#define LIST_ROW_W 312
 
 namespace {
+
+enum class View : uint8_t { None = 0, Loading, List, Error, Player };
 
 struct State {
     emote::EmoteDisplay *display = nullptr;
@@ -53,99 +53,54 @@ struct State {
 
     gfx_obj_t *page = nullptr;
     gfx_obj_t *header = nullptr;
-    gfx_obj_t *tabs = nullptr;
+    gfx_obj_t *title = nullptr;
+    gfx_obj_t *back = nullptr;
+    gfx_obj_t *back_shadow = nullptr;
+    gfx_obj_t *close = nullptr;
+    gfx_obj_t *close_shadow = nullptr;
+    gfx_obj_t *accent = nullptr;
+    gfx_obj_t *status_dot = nullptr;
     gfx_obj_t *rows[BILI_ROW_COUNT] = {};
     gfx_obj_t *video_img = nullptr;
-    gfx_obj_t *back = nullptr;
     gfx_obj_t *player_title = nullptr;
     gfx_obj_t *player_status = nullptr;
+    gfx_obj_t *player_time = nullptr;
 
-    gfx_image_dsc_t frame_dsc[BILI_FRAME_BUF_COUNT] = {};
-    uint8_t *frame_buf[BILI_FRAME_BUF_COUNT] = {};
-    volatile int display_index = 0;
-    volatile int previous_index = -1;
-    volatile int pending_index = -1;
-    volatile bool ui_update_scheduled = false;
+    uint8_t *frame_buf[2] = {};
+    gfx_image_dsc_t frame_dsc[2] = {};
+    int frame_front = 0;
+    int frame_back = 1;
+    bool frame_pending = false;
+    bool frame_schedule_pending = false;
     portMUX_TYPE frame_mux = portMUX_INITIALIZER_UNLOCKED;
 
     bool inited = false;
-    volatile bool active = false;
-    volatile bool player = false;
-    volatile bool stop_player = false;
-    volatile bool stop_audio = false;
-    volatile bool audio_ready = false;
-    volatile bool audio_failed = false;
-    int selected = -1;
-
+    bool active = false;
+    bool player = false;
+    View view = View::None;
     bili_video_t videos[BILI_ROW_COUNT] = {};
     uint8_t count = 0;
-
+    int selected = -1;
     TaskHandle_t fetch_task = nullptr;
-    TaskHandle_t player_task = nullptr;
-    TaskHandle_t video_rx_task = nullptr;
-    TaskHandle_t audio_task = nullptr;
-
-    QueueHandle_t jpeg_queue = nullptr;
-    uint8_t *jpeg_slots[BILI_JPEG_SLOT_COUNT] = {};
-    size_t jpeg_slot_len[BILI_JPEG_SLOT_COUNT] = {};
-    uint8_t jpeg_slot_state[BILI_JPEG_SLOT_COUNT] = {};
-    portMUX_TYPE jpeg_mux = portMUX_INITIALIZER_UNLOCKED;
-
-    bool media_mode = false;
-    wifi_ps_type_t saved_wifi_ps = WIFI_PS_MAX_MODEM;
+    uint32_t generation = 0;
 };
 
-static State s;
+State s;
 
-static emote_handle_t get_emote_handle()
-{
-    if (s.emote) return s.emote;
-
-    Display *display = Board::GetInstance().GetDisplay();
-    if (!display) {
-        ESP_LOGE(TAG, "[UI] Board display is null");
-        return nullptr;
-    }
-
-    auto *ed = dynamic_cast<emote::EmoteDisplay *>(display);
-    if (!ed) {
-        ESP_LOGE(TAG, "[UI] display is not EmoteDisplay");
-        return nullptr;
-    }
-
-    s.display = ed;
-    s.emote = ed->GetEmoteHandle();
-    return s.emote;
-}
-
-static gfx_obj_t *label(emote_handle_t h, const char *name)
-{
+static gfx_obj_t *label(emote_handle_t h, const char *name) {
     return emote_create_obj_by_type(h, EMOTE_OBJ_TYPE_LABEL, name);
 }
-
-static gfx_obj_t *image(emote_handle_t h, const char *name)
-{
+static gfx_obj_t *image(emote_handle_t h, const char *name) {
     return emote_create_obj_by_type(h, EMOTE_OBJ_TYPE_IMAGE, name);
 }
+static void hide(gfx_obj_t *o) { if (o) gfx_obj_set_visible(o, false); }
+static void show(gfx_obj_t *o) { if (o) gfx_obj_set_visible(o, true); }
 
-static void hide(gfx_obj_t *o)
-{
-    if (o) gfx_obj_set_visible(o, false);
-}
-
-static void show(gfx_obj_t *o)
-{
-    if (o) gfx_obj_set_visible(o, true);
-}
-
-static void set_text(gfx_obj_t *o, const char *str, uint32_t color,
-                     int x, int y, int w, int h,
-                     uint32_t bg, bool bg_on)
-{
+static void set_label(gfx_obj_t *o, const char *text, uint32_t fg,
+                      int x, int y, int w, int h, uint32_t bg, bool bg_on) {
     if (!o) return;
-
-    gfx_label_set_text(o, str ? str : "");
-    gfx_label_set_color(o, GFX_COLOR_HEX(color));
+    gfx_label_set_text(o, text ? text : "");
+    gfx_label_set_color(o, GFX_COLOR_HEX(fg));
     gfx_label_set_bg_color(o, GFX_COLOR_HEX(bg));
     gfx_label_set_bg_enable(o, bg_on);
     gfx_obj_set_pos(o, x, y);
@@ -153,1025 +108,422 @@ static void set_text(gfx_obj_t *o, const char *str, uint32_t color,
     gfx_obj_set_visible(o, true);
 }
 
-static void enter_media_network_mode()
-{
-    if (s.media_mode) return;
-    if (esp_wifi_get_ps(&s.saved_wifi_ps) != ESP_OK) s.saved_wifi_ps = WIFI_PS_MAX_MODEM;
-    esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
-    ESP_LOGI(TAG, "[NET] WiFi PS -> NONE (%s)", esp_err_to_name(err));
-    s.media_mode = true;
+static bool hit(int x, int y, int l, int t, int w, int h) {
+    return x >= l && x < l + w && y >= t && y < t + h;
 }
 
-static void maybe_leave_media_network_mode()
-{
-    if (!s.media_mode) return;
-    if (s.player_task || s.video_rx_task || s.audio_task) return;
-    Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(false);
-    esp_wifi_set_ps(s.saved_wifi_ps);
-    ESP_LOGI(TAG, "[NET] WiFi PS restored -> %d", (int)s.saved_wifi_ps);
-    s.media_mode = false;
+static std::string ellipsize_utf8(const char *src, size_t max_chars) {
+    if (!src) return {};
+    std::string t(src);
+    size_t n = 0;
+    for (size_t i = 0; i < t.size();) {
+        const uint8_t c = static_cast<uint8_t>(t[i]);
+        size_t step = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0 ? 2 : ((c & 0xF0) == 0xE0 ? 3 : 4));
+        if (n >= max_chars) { t.resize(i); t += "..."; break; }
+        i += std::min(step, t.size() - i);
+        ++n;
+    }
+    return t;
 }
 
-static bool alloc_jpeg_slots()
-{
-    if (!s.jpeg_queue) {
-        s.jpeg_queue = xQueueCreate(BILI_JPEG_QUEUE_DEPTH, sizeof(uint8_t));
-        if (!s.jpeg_queue) return false;
-    }
-    for (int i = 0; i < BILI_JPEG_SLOT_COUNT; ++i) {
-        if (!s.jpeg_slots[i]) {
-            s.jpeg_slots[i] = static_cast<uint8_t *>(
-                heap_caps_malloc(BILI_JPEG_SLOT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-            if (!s.jpeg_slots[i]) return false;
-        }
-        s.jpeg_slot_len[i] = 0;
-        s.jpeg_slot_state[i] = 0;
-    }
-    uint8_t idx;
-    while (xQueueReceive(s.jpeg_queue, &idx, 0) == pdTRUE) {
-        if (idx < BILI_JPEG_SLOT_COUNT) {
-            s.jpeg_slot_state[idx] = 0;
-            s.jpeg_slot_len[idx] = 0;
-        }
-    }
-    return true;
+static emote_handle_t get_emote_handle() {
+    if (s.emote) return s.emote;
+    Display *display = Board::GetInstance().GetDisplay();
+    if (!display) return nullptr;
+    auto *ed = dynamic_cast<emote::EmoteDisplay *>(display);
+    if (!ed) return nullptr;
+    s.display = ed;
+    s.emote = ed->GetEmoteHandle();
+    return s.emote;
 }
 
-static int acquire_jpeg_fill_slot()
-{
-    portENTER_CRITICAL(&s.jpeg_mux);
-    for (int i = 0; i < BILI_JPEG_SLOT_COUNT; ++i) {
-        if (s.jpeg_slot_state[i] == 0) {
-            s.jpeg_slot_state[i] = 1;
-            s.jpeg_slot_len[i] = 0;
-            portEXIT_CRITICAL(&s.jpeg_mux);
-            return i;
-        }
-    }
-    portEXIT_CRITICAL(&s.jpeg_mux);
-
-    uint8_t old = 0;
-    if (xQueueReceive(s.jpeg_queue, &old, 0) == pdTRUE && old < BILI_JPEG_SLOT_COUNT) {
-        portENTER_CRITICAL(&s.jpeg_mux);
-        if (s.jpeg_slot_state[old] == 2) {
-            s.jpeg_slot_state[old] = 1;
-            s.jpeg_slot_len[old] = 0;
-            portEXIT_CRITICAL(&s.jpeg_mux);
-            return old;
-        }
-        portEXIT_CRITICAL(&s.jpeg_mux);
-    }
-    return -1;
+static void make_frame_desc(int i) {
+    s.frame_dsc[i].header.magic = C_ARRAY_HEADER_MAGIC;
+    s.frame_dsc[i].header.cf = GFX_COLOR_FORMAT_RGB565;
+    s.frame_dsc[i].header.flags = 0;
+    s.frame_dsc[i].header.w = BILI_VIDEO_W;
+    s.frame_dsc[i].header.h = BILI_VIDEO_H;
+    s.frame_dsc[i].header.stride = BILI_VIDEO_W * 2;
+    s.frame_dsc[i].header.reserved = 0;
+    s.frame_dsc[i].data_size = BILI_FRAME_BYTES;
+    s.frame_dsc[i].data = s.frame_buf[i];
+    s.frame_dsc[i].reserved = nullptr;
+    s.frame_dsc[i].reserved_2 = nullptr;
 }
 
-static void queue_jpeg_slot(int slot)
-{
-    if (slot < 0 || slot >= BILI_JPEG_SLOT_COUNT) return;
-    uint8_t idx = static_cast<uint8_t>(slot);
-    portENTER_CRITICAL(&s.jpeg_mux);
-    s.jpeg_slot_state[slot] = 2;
-    portEXIT_CRITICAL(&s.jpeg_mux);
-
-    if (xQueueSend(s.jpeg_queue, &idx, 0) == pdTRUE) return;
-
-    uint8_t old = 0;
-    if (xQueueReceive(s.jpeg_queue, &old, 0) == pdTRUE && old < BILI_JPEG_SLOT_COUNT) {
-        portENTER_CRITICAL(&s.jpeg_mux);
-        s.jpeg_slot_state[old] = 0;
-        s.jpeg_slot_len[old] = 0;
-        portEXIT_CRITICAL(&s.jpeg_mux);
-    }
-
-    if (xQueueSend(s.jpeg_queue, &idx, 0) != pdTRUE) {
-        portENTER_CRITICAL(&s.jpeg_mux);
-        s.jpeg_slot_state[slot] = 0;
-        s.jpeg_slot_len[slot] = 0;
-        portEXIT_CRITICAL(&s.jpeg_mux);
-    }
-}
-
-static bool alloc_frame_buffers()
-{
-    for (int i = 0; i < BILI_FRAME_BUF_COUNT; ++i) {
-        if (s.frame_buf[i]) continue;
-        s.frame_buf[i] = static_cast<uint8_t *>(
-            jpeg_calloc_align(BILI_FRAME_BUF_SIZE, 16)
-        );
+static bool alloc_frames() {
+    for (int i = 0; i < 2; ++i) {
         if (!s.frame_buf[i]) {
-            ESP_LOGE(TAG, "[Player] frame buffer %d alloc failed", i);
-            for (int j = 0; j < BILI_FRAME_BUF_COUNT; ++j) {
-                if (s.frame_buf[j]) {
-                    jpeg_free_align(s.frame_buf[j]);
-                    s.frame_buf[j] = nullptr;
-                }
-            }
+            s.frame_buf[i] = static_cast<uint8_t *>(
+                heap_caps_malloc(BILI_FRAME_BYTES,
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        }
+        if (!s.frame_buf[i]) {
+            ESP_LOGE(TAG, "[UI] DMA frame buffer %d alloc failed", i);
             return false;
         }
+        make_frame_desc(i);
     }
-
-    for (int i = 0; i < BILI_FRAME_BUF_COUNT; ++i) {
-        s.frame_dsc[i].header.magic = C_ARRAY_HEADER_MAGIC;
-        s.frame_dsc[i].header.cf = GFX_COLOR_FORMAT_RGB565;
-        s.frame_dsc[i].header.flags = 0;
-        s.frame_dsc[i].header.w = BILI_VIDEO_W;
-        s.frame_dsc[i].header.h = BILI_VIDEO_H;
-        s.frame_dsc[i].header.stride = BILI_VIDEO_STRIDE;
-        s.frame_dsc[i].header.reserved = 0;
-        s.frame_dsc[i].data_size = BILI_FRAME_BUF_SIZE;
-        s.frame_dsc[i].data = s.frame_buf[i];
-        s.frame_dsc[i].reserved = nullptr;
-        s.frame_dsc[i].reserved_2 = nullptr;
-    }
-
-    s.display_index = 0;
-    s.previous_index = -1;
-    s.pending_index = -1;
-    s.ui_update_scheduled = false;
     return true;
 }
 
-static int acquire_decode_buffer()
-{
-    int chosen = -1;
-    portENTER_CRITICAL(&s.frame_mux);
-    for (int i = 0; i < BILI_FRAME_BUF_COUNT; ++i) {
-        if (i == s.display_index || i == s.previous_index || i == s.pending_index) continue;
-        chosen = i;
-        break;
-    }
-    portEXIT_CRITICAL(&s.frame_mux);
-    return chosen;
-}
-
-static void schedule_pending_frame_update()
-{
-    Application::GetInstance().Schedule([]() {
-        int idx = -1;
-        bool need_again = false;
-
-        portENTER_CRITICAL(&s.frame_mux);
-        idx = s.pending_index;
-        s.pending_index = -1;
-        if (idx >= 0) {
-            // Reserve the new frame before touching GFX so the decoder can never
-            // reuse the buffer while this callback is publishing it.
-            s.previous_index = s.display_index;
-            s.display_index = idx;
-        }
-        portEXIT_CRITICAL(&s.frame_mux);
-
-        emote_handle_t h = get_emote_handle();
-        if (h && idx >= 0 && s.active && s.player && !s.stop_player) {
-            emote_lock(h);
-            gfx_img_set_src(s.video_img, &s.frame_dsc[idx]);
-            emote_notify_all_refresh(h);
-            emote_unlock(h);
-
-            portENTER_CRITICAL(&s.frame_mux);
-            need_again = (s.pending_index >= 0);
-            if (!need_again) {
-                s.ui_update_scheduled = false;
-            }
-            portEXIT_CRITICAL(&s.frame_mux);
-        } else {
-            portENTER_CRITICAL(&s.frame_mux);
-            s.ui_update_scheduled = false;
-            need_again = (s.pending_index >= 0);
-            portEXIT_CRITICAL(&s.frame_mux);
-        }
-
-        if (need_again) {
-            schedule_pending_frame_update();
-        }
-    });
-}
-
-static bool init_ui_locked(emote_handle_t h)
-{
+static bool init_locked(emote_handle_t h) {
     if (s.inited) return true;
 
     s.page = label(h, "bili_page");
     s.header = label(h, "bili_header");
-    s.tabs = label(h, "bili_tabs");
-    s.video_img = image(h, "bili_video_img");
+    s.title = label(h, "bili_title");
     s.back = label(h, "bili_back");
+    s.back_shadow = label(h, "bili_back_shadow");
+    s.close = label(h, "bili_close");
+    s.close_shadow = label(h, "bili_close_shadow");
+    s.accent = label(h, "bili_accent");
+    s.status_dot = label(h, "bili_status_dot");
+    s.video_img = image(h, "bili_video_img");
     s.player_title = label(h, "bili_player_title");
     s.player_status = label(h, "bili_player_status");
+    s.player_time = label(h, "bili_player_time");
 
-    if (!s.page || !s.header || !s.tabs || !s.video_img ||
-        !s.back || !s.player_title || !s.player_status) {
+    if (!s.page || !s.header || !s.title || !s.back || !s.back_shadow ||
+        !s.close || !s.close_shadow || !s.accent || !s.status_dot ||
+        !s.video_img || !s.player_title || !s.player_status || !s.player_time) {
         ESP_LOGE(TAG, "[UI] create fixed object failed");
         return false;
     }
 
     for (int i = 0; i < BILI_ROW_COUNT; ++i) {
-        char name[24];
+        char name[32];
         snprintf(name, sizeof(name), "bili_row_%d", i);
         s.rows[i] = label(h, name);
-        if (!s.rows[i]) {
-            ESP_LOGE(TAG, "[UI] create row %d failed", i);
-            return false;
-        }
+        if (!s.rows[i]) return false;
         gfx_label_set_long_mode(s.rows[i], GFX_LABEL_LONG_WRAP);
     }
+    if (!alloc_frames()) return false;
 
-    if (!alloc_frame_buffers()) return false;
-    if (!alloc_jpeg_slots()) return false;
-
-    // Full-screen opaque background.
-    set_text(s.page, "", 0x202020, 0, 0, 360, 360, 0xF4F4F4, true);
-
-    set_text(s.header, "哔哩哔哩", 0xFFFFFF, 0, 0, 360, 42, 0xFB7299, true);
-    set_text(s.tabs, "首页       热门       推荐", 0x444444, 8, 44, 344, 30, 0xFFFFFF, true);
-
-    for (int i = 0; i < BILI_ROW_COUNT; ++i) {
-        set_text(s.rows[i], "", 0x202020, 8, 80 + i * 68, 344, 60,
-                 (i % 2) ? 0xFFFFFF : 0xFAFAFA, true);
-    }
-
-    // Player image occupies the central 320x176 area.
-    gfx_obj_set_pos(s.video_img, 20, 44);
+    // Player image is always the confirmed 320x176 window.
+    gfx_obj_set_pos(s.video_img, PLAYER_X, PLAYER_Y);
     gfx_obj_set_size(s.video_img, BILI_VIDEO_W, BILI_VIDEO_H);
-
-    set_text(s.back, "‹ 返回", 0xFFFFFF, 6, 6, 74, 30, 0xD94F79, true);
-    set_text(s.player_title, "", 0xFFFFFF, 8, 228, 344, 56, 0x202020, true);
-    set_text(s.player_status, "", 0xCCCCCC, 8, 288, 344, 28, 0x202020, true);
-
-    hide(s.page);
-    hide(s.header);
-    hide(s.tabs);
-    hide(s.video_img);
-    hide(s.back);
-    hide(s.player_title);
-    hide(s.player_status);
-    for (auto *r : s.rows) hide(r);
 
     s.inited = true;
     return true;
 }
 
-static void clear_all_locked()
-{
-    hide(s.page);
-    hide(s.header);
-    hide(s.tabs);
-    hide(s.video_img);
-    hide(s.back);
-    hide(s.player_title);
-    hide(s.player_status);
+static void clear_overlay_locked() {
+    hide(s.header); hide(s.title); hide(s.back); hide(s.back_shadow);
+    hide(s.close); hide(s.close_shadow); hide(s.accent); hide(s.status_dot);
+    hide(s.video_img); hide(s.player_title); hide(s.player_status); hide(s.player_time);
     for (auto *r : s.rows) hide(r);
-}
-
-static void enter_bili_locked(emote_handle_t h)
-{
-    emote_stop_anim_dialog(h);
-    // Keep the original VoCat Emote animation running. The Bilibili page is
-    // rendered as an opaque 360x360 overlay, so the face does not need to be
-    // disabled and the base EmoteDisplay state remains intact.
-    s.active = true;
-}
-
-static void show_loading_locked(emote_handle_t h)
-{
-    clear_all_locked();
-    enter_bili_locked(h);
-    s.player = false;
-    s.selected = -1;
-
-    set_text(s.page, "", 0x202020, 0, 0, 360, 360, 0xF4F4F4, true);
-    set_text(s.header, "哔哩哔哩", 0xFFFFFF, 0, 0, 360, 42, 0xFB7299, true);
-    set_text(s.tabs, "正在加载热门榜单...", 0x666666, 12, 54, 336, 30, 0xF4F4F4, true);
-
     show(s.page);
-    show(s.header);
-    show(s.tabs);
-    emote_notify_all_refresh(h);
 }
 
-static void show_list_locked(emote_handle_t h)
-{
-    clear_all_locked();
-    enter_bili_locked(h);
-    s.player = false;
-    s.selected = -1;
+static void glass_top_locked(const char *heading, bool back, bool close, bool dark) {
+    const uint32_t panel = dark ? 0x171B21 : 0xE9EDF2;
+    const uint32_t fg = dark ? 0xF2F4F7 : 0x343A43;
+    const uint32_t accent = dark ? 0x7FD6C5 : 0xFB7299;
 
-    set_text(s.tabs, "首页       热门       推荐", 0x444444, 8, 44, 344, 30, 0xFFFFFF, true);
-
-    show(s.page);
+    // Frosted-card feel: softly separated surface, no hard button rectangle.
+    set_label(s.header, "", fg, 40, 5, 280, 42, panel, true);
+    set_label(s.accent, "", dark ? 0x343A42 : 0xD8DEE6, 78, 46, 204, 1,
+              dark ? 0x343A42 : 0xD8DEE6, true);
     show(s.header);
-    show(s.tabs);
+    show(s.accent);
 
-    for (int i = 0; i < BILI_ROW_COUNT; ++i) {
-        if (i < s.count) {
-            char buf[240];
-            snprintf(buf, sizeof(buf), "%s\n▶ %lu 次播放   %s",
-                     s.videos[i].title,
-                     (unsigned long)s.videos[i].play_count,
-                     s.videos[i].bvid);
-            set_text(s.rows[i], buf, 0x202020,
-                     8, 80 + i * 68, 344, 60,
-                     (i % 2) ? 0xFFFFFF : 0xFAFAFA, true);
-            gfx_label_set_long_mode(s.rows[i], GFX_LABEL_LONG_WRAP);
-            show(s.rows[i]);
-        }
+    if (heading && *heading) {
+        set_label(s.title, heading, fg, 78, 10, 204, 26, panel, false);
+        gfx_label_set_long_mode(s.title, GFX_LABEL_LONG_CLIP);
+        show(s.title);
+    } else {
+        hide(s.title);
     }
 
+    // Confirmed position retained. ASCII glyphs avoid missing-glyph font issues.
+    if (back) {
+        set_label(s.back, "<", accent, PLAYER_BACK_X, PLAYER_BACK_Y,
+                  PLAYER_BACK_SIZE, PLAYER_BACK_SIZE, 0x000000, false);
+        show(s.back);
+    } else hide(s.back);
+
+    if (close) {
+        set_label(s.close, "x", accent, 305, 8, 28, 28, 0x000000, false);
+        show(s.close);
+    } else hide(s.close);
+
+    hide(s.back_shadow);
+    hide(s.close_shadow);
+}
+
+static void show_loading_locked(emote_handle_t h) {
+    clear_overlay_locked();
+    s.view = View::Loading; s.player = false; s.selected = -1;
+    set_label(s.page, "", 0, 0, 0, UI_W, UI_H, 0xF0F2F6, true);
+    glass_top_locked("哔哩哔哩", true, true, false);
+    set_label(s.rows[0], "正在加载", 0x4F5660, 70, 144, 220, 40, 0xE9ECF1, true);
+    set_label(s.rows[1], "·  ·  ·", 0xA9B0BA, 120, 190, 120, 28, 0xF0F2F6, false);
+    show(s.rows[0]); show(s.rows[1]);
     emote_notify_all_refresh(h);
 }
 
-static void update_player_status(const char *status)
-{
-    Application::GetInstance().Schedule([status_copy = std::string(status ? status : "")]() {
+static void show_error_locked(emote_handle_t h, const char *msg) {
+    clear_overlay_locked();
+    s.view = View::Error; s.player = false;
+    set_label(s.page, "", 0, 0, 0, UI_W, UI_H, 0xF0F2F6, true);
+    glass_top_locked("哔哩哔哩", true, true, false);
+    set_label(s.rows[0], "!", 0xFB7299, 146, 132, 68, 48, 0xF0F2F6, false);
+    set_label(s.rows[1], msg ? msg : "暂时无法加载", 0x545B65, 54, 200, 252, 42, 0xE9ECF1, true);
+    show(s.rows[0]); show(s.rows[1]);
+    emote_notify_all_refresh(h);
+}
+
+static void show_list_locked(emote_handle_t h) {
+    clear_overlay_locked();
+    s.view = View::List; s.player = false; s.selected = -1;
+    set_label(s.page, "", 0, 0, 0, UI_W, UI_H, 0xF3F5F8, true);
+    glass_top_locked("哔哩哔哩", true, true, false);
+
+    for (int i = 0; i < BILI_ROW_COUNT; ++i) {
+        if (i >= s.count) continue;
+        const int y = LIST_START_Y + i * (LIST_ROW_H + LIST_ROW_GAP);
+        const std::string t = ellipsize_utf8(s.videos[i].title, 24);
+        char buf[192];
+        snprintf(buf, sizeof(buf), "%s\n%lu 次播放", t.c_str(),
+                 (unsigned long)s.videos[i].play_count);
+        // Low-contrast alternating surfaces emulate a frosted card.
+        set_label(s.rows[i], buf, 0x20252B, LIST_ROW_X, y, LIST_ROW_W, LIST_ROW_H,
+                  i == 0 ? 0xF8F9FB : 0xE8ECF2, true);
+        gfx_label_set_long_mode(s.rows[i], GFX_LABEL_LONG_WRAP);
+        show(s.rows[i]);
+    }
+    if (s.count == 0) {
+        set_label(s.rows[0], "暂无内容", 0x69717C, 70, 150, 220, 44, 0xE8ECF2, true);
+        show(s.rows[0]);
+    }
+    emote_notify_all_refresh(h);
+}
+
+static void show_player_locked(emote_handle_t h, int idx) {
+    if (idx < 0 || idx >= s.count) return;
+    clear_overlay_locked();
+    s.view = View::Player; s.player = true; s.selected = idx;
+    set_label(s.page, "", 0, 0, 0, UI_W, UI_H, 0x0B0D10, true);
+    glass_top_locked("", true, true, true);
+
+    gfx_obj_set_pos(s.video_img, PLAYER_X, PLAYER_Y);
+    gfx_obj_set_size(s.video_img, BILI_VIDEO_W, BILI_VIDEO_H);
+    hide(s.video_img);
+
+    const std::string title = ellipsize_utf8(s.videos[idx].title, 28);
+    // Bright centered title directly under the video.
+    set_label(s.player_title, title.c_str(), 0xF2F4F6,
+              24, PLAYER_TITLE_Y, 312, 44, 0x171B21, true);
+    gfx_label_set_long_mode(s.player_title, GFX_LABEL_LONG_WRAP);
+    show(s.player_title);
+
+    // Dark translucent-style pill, centered below the title.
+    set_label(s.player_status, "视频连接中", 0xCFD6DE,
+              92, PLAYER_STATUS_Y, 176, 24, 0x20262D, true);
+    set_label(s.status_dot, "•", 0x65E394,
+              111, PLAYER_STATUS_Y - 1, 18, 24, 0x171C22, true);
+    set_label(s.player_time, "", 0x66707A, 140, PLAYER_STATUS_Y + 28, 80, 16, 0x000000, false);
+    show(s.player_status); show(s.status_dot); show(s.player_time);
+
+    ESP_LOGI(TAG, "[UI] Player layout back=(%d,%d) video=(%d,%d,%d,%d) title_y=%d status_y=%d",
+             PLAYER_BACK_X, PLAYER_BACK_Y, PLAYER_X, PLAYER_Y, BILI_VIDEO_W, BILI_VIDEO_H,
+             PLAYER_TITLE_Y, PLAYER_STATUS_Y);
+    emote_notify_all_refresh(h);
+}
+
+static void update_status_ui(const char *status_text) {
+    const std::string text = status_text ? status_text : "";
+    Application::GetInstance().Schedule([text]() {
         emote_handle_t h = get_emote_handle();
-        if (!h || !s.active || !s.player) return;
+        if (!h || !s.active || !s.player || s.view != View::Player) return;
         emote_lock(h);
-        set_text(s.player_status, status_copy.c_str(), 0xD0D0D0, 8, 288, 344, 28, 0x202020, true);
-        show(s.player_status);
+        set_label(s.player_status, text.c_str(), 0xC7D0D9,
+                  92, PLAYER_STATUS_Y, 176, 24, 0x171C22, true);
+        const bool ok = text.find("连接") != std::string::npos || text.find("显示") != std::string::npos || text.find("播放") != std::string::npos;
+        set_label(s.status_dot, "•", ok ? 0x65E394 : 0xF3C86B,
+                  111, PLAYER_STATUS_Y - 1, 18, 24, 0x171C22, true);
+        show(s.status_dot);
         emote_notify_all_refresh(h);
         emote_unlock(h);
     });
 }
 
-static void show_player_locked(emote_handle_t h, int index)
-{
-    if (index < 0 || index >= s.count) return;
-
-    clear_all_locked();
-    enter_bili_locked(h);
-    s.player = true;
-    s.selected = index;
-    s.stop_player = false;
-    s.stop_audio = false;
-
-    // Give the video decoder the CPU headroom it needs while Bilibili media is playing.
-    Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(true);
-    s.audio_ready = false;
-    s.audio_failed = false;
-
-    set_text(s.page, "", 0x101010, 0, 0, 360, 360, 0x101010, true);
-    show(s.page);
-    show(s.video_img);
-    show(s.back);
-    show(s.player_title);
-    show(s.player_status);
-
-    set_text(s.player_title, s.videos[index].title,
-             0xFFFFFF, 8, 228, 344, 56, 0x202020, true);
-    set_text(s.player_status, "正在连接视频流...",
-             0xD0D0D0, 8, 288, 344, 28, 0x202020, true);
-
-    emote_notify_all_refresh(h);
-}
-
-static void stop_bili_audio()
-{
-    s.stop_audio = true;
-    s.audio_ready = true;
-    s.audio_failed = true;
-    // Drop any queued Bilibili PCM immediately. The AudioService playback
-    // worker may still be draining the previous chunk, but no new media
-    // audio will be accepted after this point.
-    Application::GetInstance().GetAudioService().ResetDecoder();
-    maybe_leave_media_network_mode();
-}
-
-static void audio_task(void*)
-{
-    const int index = s.selected;
-    if (index < 0 || index >= s.count) {
-        s.audio_failed = true;
-        s.audio_ready = true;
-        s.audio_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    char url[320];
-    snprintf(url, sizeof(url), "%s%s", BILI_AUDIO_URL_BASE, s.videos[index].bvid);
-    ESP_LOGI(TAG, "[Audio] open %s", url);
-
-    esp_http_client_config_t cfg = {};
-    cfg.url = url;
-    cfg.timeout_ms = 15000;
-    cfg.buffer_size = 32768;
-    cfg.buffer_size_tx = 1024;
-
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) {
-        ESP_LOGE(TAG, "[Audio] http init failed");
-        s.audio_failed = true;
-        s.audio_ready = true;
-        s.audio_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    if (esp_http_client_open(client, 0) != ESP_OK) {
-        ESP_LOGE(TAG, "[Audio] open failed");
-        esp_http_client_cleanup(client);
-        s.audio_failed = true;
-        s.audio_ready = true;
-        s.audio_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    int64_t content_length = esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-    ESP_LOGI(TAG, "[Audio] connected status=%d content_len=%lld", status, content_length);
-
-    if (status != 200) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        s.audio_failed = true;
-        s.audio_ready = true;
-        s.audio_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    // IMPORTANT: keep all large buffers on heap, not on the FreeRTOS task stack.
-    uint8_t* rx = static_cast<uint8_t*>(heap_caps_malloc(BILI_RX_CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    uint8_t* pcm_bytes = static_cast<uint8_t*>(heap_caps_malloc(BILI_AUDIO_CHUNK_BYTES, MALLOC_CAP_8BIT));
-    if (!rx || !pcm_bytes) {
-        ESP_LOGE(TAG, "[Audio] heap buffer allocation failed");
-        if (rx) heap_caps_free(rx);
-        if (pcm_bytes) heap_caps_free(pcm_bytes);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        s.audio_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    size_t pcm_used = 0;
-    uint32_t chunks = 0;
-    size_t prebuffer_samples = 0;
-    std::vector<int16_t> prebuffer;
-    prebuffer.reserve(BILI_AUDIO_CHUNK_SAMPLES * BILI_AUDIO_PREBUFFER_CHUNKS);
-
-    auto& audio = Application::GetInstance().GetAudioService();
-
-    while (!s.stop_audio && s.active && s.player) {
-        const int64_t read_t0 = esp_timer_get_time();
-        int n = esp_http_client_read(client, reinterpret_cast<char*>(rx), BILI_RX_CHUNK_SIZE);
-        const int64_t read_us = esp_timer_get_time() - read_t0;
-        if (read_us > 100000) {
-            ESP_LOGW(TAG, "[BLOCK] [AudioRX] http_read blocked %lld ms, got %d",
-                     (long long)(read_us / 1000), n);
-        }
-
-        if (n < 0) {
-            if (n == -ESP_ERR_HTTP_EAGAIN) {
-                vTaskDelay(pdMS_TO_TICKS(20));
-                continue;
-            }
-            ESP_LOGE(TAG, "[Audio] stream read error=%d", n);
-            s.audio_failed = true;
-            break;
-        }
-
-        if (n == 0) {
-            if (esp_http_client_is_complete_data_received(client)) {
-                ESP_LOGI(TAG, "[Audio] stream ended");
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        size_t off = 0;
-        while (off < static_cast<size_t>(n) && !s.stop_audio && s.active && s.player) {
-            const size_t copy_len = std::min(
-                BILI_AUDIO_CHUNK_BYTES - pcm_used,
-                static_cast<size_t>(n) - off);
-
-            memcpy(pcm_bytes + pcm_used, rx + off, copy_len);
-            pcm_used += copy_len;
-            off += copy_len;
-
-            if (pcm_used != BILI_AUDIO_CHUNK_BYTES) {
-                continue;
-            }
-
-            /*
-             * Keep the first 200 ms locally. Video is allowed to publish its
-             * first frame only after this prebuffer is ready, so both streams
-             * start from approximately the same media time.
-             */
-            if (prebuffer_samples < BILI_AUDIO_CHUNK_SAMPLES * BILI_AUDIO_PREBUFFER_CHUNKS) {
-                const auto* src = reinterpret_cast<const int16_t*>(pcm_bytes);
-                prebuffer.insert(
-                    prebuffer.end(),
-                    src,
-                    src + BILI_AUDIO_CHUNK_SAMPLES);
-                prebuffer_samples += BILI_AUDIO_CHUNK_SAMPLES;
-
-                if (prebuffer_samples ==
-                    BILI_AUDIO_CHUNK_SAMPLES * BILI_AUDIO_PREBUFFER_CHUNKS) {
-
-                    for (int block = 0; block < BILI_AUDIO_PREBUFFER_CHUNKS; ++block) {
-                        const int16_t* block_ptr =
-                            prebuffer.data() + block * BILI_AUDIO_CHUNK_SAMPLES;
-
-                        if (audio.PushPcmToPlaybackQueue(
-                                block_ptr,
-                                BILI_AUDIO_CHUNK_SAMPLES,
-                                BILI_AUDIO_SAMPLE_RATE)) {
-                            ++chunks;
-                        } else {
-                            ESP_LOGW(TAG, "[Audio] prebuffer chunk dropped");
-                        }
-                    }
-
-                    prebuffer.clear();
-                    s.audio_ready = true;
-                }
-            } else {
-                const int16_t* block_ptr =
-                    reinterpret_cast<const int16_t*>(pcm_bytes);
-
-                if (audio.PushPcmToPlaybackQueue(
-                        block_ptr,
-                        BILI_AUDIO_CHUNK_SAMPLES,
-                        BILI_AUDIO_SAMPLE_RATE)) {
-                    ++chunks;
-                }
-            }
-
-            if (chunks > 0 &&
-                (chunks <= 2 || (chunks % 20) == 0)) {
-                ESP_LOGI(TAG, "[Audio] PCM chunk=%lu",
-                         (unsigned long)chunks);
-            }
-
-            pcm_used = 0;
-        }
-    }
-
-    /*
-     * If audio died before the 200 ms prebuffer completed, unblock the video
-     * so the device can still show video without waiting forever.
-     */
-    if (!s.audio_ready) {
-        s.audio_ready = true;
-    }
-
-    heap_caps_free(rx);
-    heap_caps_free(pcm_bytes);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    ESP_LOGI(TAG, "[Audio] task exit chunks=%lu", (unsigned long)chunks);
-    s.audio_task = nullptr;
-    maybe_leave_media_network_mode();
-    vTaskDelete(nullptr);
-}
-
-static bool start_audio_task(int index)
-{
-    if (s.audio_task != nullptr) return true;
-    s.stop_audio = false;
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        audio_task, "bili_audio", 8192, nullptr, 3, &s.audio_task, 0);
-    if (ret != pdPASS) {
-        s.audio_task = nullptr;
-        ESP_LOGE(TAG, "[Audio] task create failed");
-        return false;
-    }
-    ESP_LOGI(TAG, "[Audio] task created index=%d", index);
-    return true;
-}
-
-static bool decode_and_publish(const uint8_t *jpeg, int jpeg_len)
-{
-    if (!jpeg || jpeg_len < 4 || jpeg_len > BILI_JPEG_SLOT_SIZE || !s.player || s.stop_player) return false;
-
-    const int next = acquire_decode_buffer();
-    if (next < 0) return false;
-    uint8_t *out = s.frame_buf[next];
-    if (!out) return false;
-
-    uint8_t *decoded = nullptr;
-    size_t decoded_len = 0, width = 0, height = 0, stride = 0;
-    const int64_t t0 = esp_timer_get_time();
-    esp_err_t ret = jpeg_to_image(jpeg, (size_t)jpeg_len, &decoded, &decoded_len, &width, &height, &stride);
-    const int64_t decode_us = esp_timer_get_time() - t0;
-    ESP_LOGI(TAG, "[PERF] JPEG decode %lld ms", (long long)(decode_us / 1000));
-
-    if (ret != ESP_OK || !decoded) {
-        ESP_LOGW(TAG, "[Player] jpeg_to_image failed=%d size=%d", (int)ret, jpeg_len);
-        return false;
-    }
-    if (width != BILI_VIDEO_W || height != BILI_VIDEO_H ||
-        stride < BILI_VIDEO_STRIDE || decoded_len < (size_t)BILI_VIDEO_STRIDE * BILI_VIDEO_H) {
-        jpeg_free_align(decoded);
-        return false;
-    }
-
-    const size_t pixel_count = (size_t)BILI_VIDEO_W * BILI_VIDEO_H;
-    const uint16_t *src = reinterpret_cast<const uint16_t *>(decoded);
-    uint16_t *dst = reinterpret_cast<uint16_t *>(out);
-    for (size_t i = 0; i < pixel_count; ++i) {
-        const uint16_t v = src[i];
-        dst[i] = (uint16_t)((v << 8) | (v >> 8));
-    }
-    jpeg_free_align(decoded);
-
-    s.frame_dsc[next].header.magic = C_ARRAY_HEADER_MAGIC;
-    s.frame_dsc[next].header.cf = GFX_COLOR_FORMAT_RGB565;
-    s.frame_dsc[next].header.flags = 0;
-    s.frame_dsc[next].header.w = BILI_VIDEO_W;
-    s.frame_dsc[next].header.h = BILI_VIDEO_H;
-    s.frame_dsc[next].header.stride = BILI_VIDEO_STRIDE;
-    s.frame_dsc[next].header.reserved = 0;
-    s.frame_dsc[next].data_size = BILI_FRAME_BUF_SIZE;
-    s.frame_dsc[next].data = out;
-    s.frame_dsc[next].reserved = nullptr;
-    s.frame_dsc[next].reserved_2 = nullptr;
-
-    bool need_schedule = false;
+static void schedule_frame_refresh() {
     portENTER_CRITICAL(&s.frame_mux);
-    if (s.pending_index >= 0) {
-        const int old = s.pending_index;
-        s.pending_index = -1;
-        (void)old;
-    }
-    s.pending_index = next;
-    if (!s.ui_update_scheduled) {
-        s.ui_update_scheduled = true;
-        need_schedule = true;
-    }
+    if (s.frame_schedule_pending) { portEXIT_CRITICAL(&s.frame_mux); return; }
+    s.frame_schedule_pending = true;
     portEXIT_CRITICAL(&s.frame_mux);
-    if (need_schedule) schedule_pending_frame_update();
-    return true;
-}
 
-static void video_decode_task(void *)
-{
-    ESP_LOGI(TAG, "[VDEC] task start");
-    uint32_t frames = 0, dropped = 0;
-    while (!s.stop_player && s.active && s.player) {
-        uint8_t slot = 0;
-        if (xQueueReceive(s.jpeg_queue, &slot, pdMS_TO_TICKS(100)) != pdTRUE) continue;
-        if (slot >= BILI_JPEG_SLOT_COUNT) continue;
-
-        size_t len = 0;
-        portENTER_CRITICAL(&s.jpeg_mux);
-        if (s.jpeg_slot_state[slot] != 2) { portEXIT_CRITICAL(&s.jpeg_mux); continue; }
-        s.jpeg_slot_state[slot] = 3;
-        len = s.jpeg_slot_len[slot];
-        portEXIT_CRITICAL(&s.jpeg_mux);
-
-        if (!s.stop_player && s.active && s.player && len) {
-            if (decode_and_publish(s.jpeg_slots[slot], (int)len)) {
-                ++frames;
-                if (frames <= 3 || frames % 10 == 0)
-                    ESP_LOGI(TAG, "[VDEC] frame=%lu q=%u", (unsigned long)frames,
-                             (unsigned)uxQueueMessagesWaiting(s.jpeg_queue));
-            } else {
-                ++dropped;
-            }
-        }
-
-        portENTER_CRITICAL(&s.jpeg_mux);
-        s.jpeg_slot_state[slot] = 0;
-        s.jpeg_slot_len[slot] = 0;
-        portEXIT_CRITICAL(&s.jpeg_mux);
-    }
-    s.player_task = nullptr;
-    ESP_LOGI(TAG, "[VDEC] exit frames=%lu dropped=%lu", (unsigned long)frames, (unsigned long)dropped);
-    maybe_leave_media_network_mode();
-    vTaskDelete(nullptr);
-}
-
-static void video_rx_task(void *)
-{
-    const int index = s.selected;
-    esp_http_client_handle_t client = nullptr;
-    uint8_t *rx = nullptr;
-    int slot = -1;
-    uint32_t frames = 0, dropped = 0;
-
-    do {
-        if (index < 0 || index >= s.count) break;
-        if (!alloc_jpeg_slots()) break;
-
-        char url[320];
-        snprintf(url, sizeof(url), "%s%s", BILI_PLAY_URL_BASE, s.videos[index].bvid);
-        ESP_LOGI(TAG, "[RX] open %s", url);
-
-        esp_http_client_config_t cfg = {};
-        cfg.url = url;
-        cfg.timeout_ms = 15000;
-        cfg.buffer_size = 32768;
-        cfg.buffer_size_tx = 1024;
-        cfg.keep_alive_enable = true;
-
-        client = esp_http_client_init(&cfg);
-        if (!client) break;
-        if (esp_http_client_open(client, 0) != ESP_OK) break;
-
-        int content_length = esp_http_client_fetch_headers(client);
-        int status = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "[RX] connected status=%d content_len=%d", status, content_length);
-        if (status != 200) break;
-
-        rx = static_cast<uint8_t *>(heap_caps_malloc(BILI_RX_CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!rx) break;
-
-        slot = acquire_jpeg_fill_slot();
-        if (slot < 0) break;
-        size_t used = 0;
-        bool in_frame = false;
-        bool prev_ff = false;
-
-        while (!s.stop_player && s.active && s.player) {
-            const int64_t t0 = esp_timer_get_time();
-            int n = esp_http_client_read(client, reinterpret_cast<char *>(rx), BILI_RX_CHUNK_SIZE);
-            const int64_t wait_us = esp_timer_get_time() - t0;
-            if (wait_us > 100000) {
-                ESP_LOGW(TAG, "[BLOCK] VideoRX read=%lldms n=%d q=%u", (long long)(wait_us/1000), n,
-                         (unsigned)uxQueueMessagesWaiting(s.jpeg_queue));
-            }
-            if (n < 0) {
-                if (n == -ESP_ERR_HTTP_EAGAIN) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
-                break;
-            }
-            if (n == 0) {
-                if (esp_http_client_is_complete_data_received(client)) break;
-                vTaskDelay(pdMS_TO_TICKS(2));
-                continue;
-            }
-
-            for (int i = 0; i < n; ++i) {
-                const uint8_t b = rx[i];
-                if (!in_frame) {
-                    if (prev_ff && b == 0xD8) {
-                        slot = acquire_jpeg_fill_slot();
-                        if (slot < 0) { ++dropped; prev_ff = false; continue; }
-                        used = 0;
-                        s.jpeg_slots[slot][used++] = 0xFF;
-                        s.jpeg_slots[slot][used++] = 0xD8;
-                        in_frame = true;
-                        prev_ff = false;
-                        continue;
-                    }
-                    prev_ff = (b == 0xFF);
-                    continue;
-                }
-
-                if (used >= BILI_JPEG_SLOT_SIZE) {
-                    portENTER_CRITICAL(&s.jpeg_mux);
-                    s.jpeg_slot_state[slot] = 0;
-                    s.jpeg_slot_len[slot] = 0;
-                    portEXIT_CRITICAL(&s.jpeg_mux);
-                    ++dropped;
-                    in_frame = false;
-                    prev_ff = (b == 0xFF);
-                    slot = -1;
-                    continue;
-                }
-                s.jpeg_slots[slot][used++] = b;
-                if (prev_ff && b == 0xD9) {
-                    s.jpeg_slot_len[slot] = used;
-                    queue_jpeg_slot(slot);
-                    ++frames;
-                    if (frames <= 3 || frames % 30 == 0)
-                        ESP_LOGI(TAG, "[RX] queued=%lu q=%u dropped=%lu", (unsigned long)frames,
-                                 (unsigned)uxQueueMessagesWaiting(s.jpeg_queue), (unsigned long)dropped);
-                    in_frame = false;
-                    prev_ff = false;
-                    slot = -1;
-                    continue;
-                }
-                prev_ff = (b == 0xFF);
-            }
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-    } while (false);
-
-    if (slot >= 0 && slot < BILI_JPEG_SLOT_COUNT) {
-        portENTER_CRITICAL(&s.jpeg_mux);
-        if (s.jpeg_slot_state[slot] == 1) {
-            s.jpeg_slot_state[slot] = 0;
-            s.jpeg_slot_len[slot] = 0;
-        }
-        portEXIT_CRITICAL(&s.jpeg_mux);
-    }
-    if (rx) heap_caps_free(rx);
-    if (client) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-    }
-    s.stop_player = true;
-    s.stop_audio = true;
-    Application::GetInstance().GetAudioService().ResetDecoder();
-    s.video_rx_task = nullptr;
-    ESP_LOGI(TAG, "[RX] exit frames=%lu dropped=%lu", (unsigned long)frames, (unsigned long)dropped);
-    maybe_leave_media_network_mode();
-    vTaskDelete(nullptr);
-}
-
-static bool start_player_task(int index)
-{
-    if (s.player_task || s.video_rx_task) return true;
-    enter_media_network_mode();
-    s.selected = index;
-    s.stop_player = false;
-    s.stop_audio = false;
-    if (!alloc_jpeg_slots()) return false;
-
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        video_decode_task, "bili_vdec", BILI_PLAYER_STACK_SIZE,
-        nullptr, 5, &s.player_task, 1);
-    if (ret != pdPASS) { s.player_task = nullptr; return false; }
-
-    ret = xTaskCreatePinnedToCore(
-        video_rx_task, "bili_vrx", 10 * 1024,
-        nullptr, 8, &s.video_rx_task, 1);
-    if (ret != pdPASS) { s.video_rx_task = nullptr; s.stop_player = true; return false; }
-    ESP_LOGI(TAG, "[Player] RX/Decode pipeline started index=%d", index);
-    return true;
-}
-
-static void schedule_player(int index)
-{
-    Application::GetInstance().Schedule([index]() {
+    Application::GetInstance().Schedule([]() {
         emote_handle_t h = get_emote_handle();
-        if (!h) return;
-
-        emote_lock(h);
-        if (init_ui_locked(h)) {
-            show_player_locked(h, index);
+        if (!h || !s.active || !s.player || s.view != View::Player) {
+            portENTER_CRITICAL(&s.frame_mux);
+            s.frame_schedule_pending = false;
+            portEXIT_CRITICAL(&s.frame_mux);
+            return;
         }
-        emote_unlock(h);
+        int front = 0;
+        bool again = false;
+        portENTER_CRITICAL(&s.frame_mux);
+        if (s.frame_pending) {
+            front = s.frame_back;
+            s.frame_front = front;
+            s.frame_pending = false;
+            s.frame_back = 1 - front;
+        }
+        portEXIT_CRITICAL(&s.frame_mux);
 
-        // Start audio first. The server-side media URL cache is shared between
-        // /bili/play and /bili/audio, so both streams now start from the same
-        // resolved DASH source without a second B站 playurl request.
-        start_audio_task(index);
-        start_player_task(index);
+        const int64_t t0 = esp_timer_get_time();
+        emote_lock(h);
+        gfx_img_set_src(s.video_img, &s.frame_dsc[front]);
+        show(s.video_img);
+        emote_notify_all_refresh(h);
+        emote_unlock(h);
+        const int64_t dt = esp_timer_get_time() - t0;
+        if (dt > 30000) ESP_LOGW(TAG, "[UI][FRAME] refresh BLOCK %lldms", (long long)(dt / 1000));
+
+        portENTER_CRITICAL(&s.frame_mux);
+        again = s.frame_pending;
+        s.frame_schedule_pending = false;
+        portEXIT_CRITICAL(&s.frame_mux);
+        if (again) schedule_frame_refresh();
     });
 }
 
-static void schedule_list()
-{
+static void player_frame_cb(const bili_player_frame_t *frame, void *) {
+    if (!frame || !frame->rgb565 || frame->width != BILI_VIDEO_W || frame->height != BILI_VIDEO_H) return;
+    int back;
+    portENTER_CRITICAL(&s.frame_mux);
+    back = s.frame_back;
+    portEXIT_CRITICAL(&s.frame_mux);
+    if (!s.frame_buf[back]) return;
+    const int64_t t0 = esp_timer_get_time();
+    memcpy(s.frame_buf[back], frame->rgb565, BILI_FRAME_BYTES);
+    const int64_t dt = esp_timer_get_time() - t0;
+    if (dt > 20000) ESP_LOGW(TAG, "[UI][FRAME] memcpy BLOCK %lldms", (long long)(dt / 1000));
+    portENTER_CRITICAL(&s.frame_mux);
+    s.frame_pending = true;
+    portEXIT_CRITICAL(&s.frame_mux);
+    schedule_frame_refresh();
+}
+
+static void player_status_cb(const char *text, void *) { update_status_ui(text); }
+
+static void exit_bilibili_async() {
+    bili_player_stop();
+    ++s.generation;
     Application::GetInstance().Schedule([]() {
         emote_handle_t h = get_emote_handle();
         if (!h) return;
         emote_lock(h);
-        if (init_ui_locked(h)) show_list_locked(h);
+        clear_overlay_locked();
+        hide(s.page);
+        s.active = false; s.player = false; s.view = View::None; s.selected = -1;
+        emote_notify_all_refresh(h);
         emote_unlock(h);
     });
 }
 
-static void fetch_task(void *)
-{
+static void schedule_list() {
+    Application::GetInstance().Schedule([]() {
+        emote_handle_t h = get_emote_handle();
+        if (!h) return;
+        emote_lock(h);
+        if (s.inited && s.active) show_list_locked(h);
+        emote_unlock(h);
+    });
+}
+
+static void fetch_task(void *) {
+    const uint32_t gen = s.generation;
     bili_video_t tmp[BILI_RECORD_MAX] = {};
     uint8_t n = 0;
-
-    if (vocat_bilibili_check_wifi()) {
-        n = vocat_bilibili_get_recommend(tmp, BILI_RECORD_MAX);
-    }
-
-    if (n > 0) {
-        memcpy(s.videos, tmp, sizeof(bili_video_t) * n);
-        s.count = n;
-        ESP_LOGI(TAG, "[Fetch] result count=%d", n);
-        schedule_list();
-    } else {
-        ESP_LOGE(TAG, "[Fetch] result count=0");
+    ESP_LOGI(TAG, "[LIST] fetch start generation=%u", gen);
+    if (vocat_bilibili_check_wifi()) n = vocat_bilibili_get_recommend(tmp, BILI_RECORD_MAX);
+    ESP_LOGI(TAG, "[LIST] fetch result count=%u generation=%u current=%u", n, gen, s.generation);
+    if (gen != s.generation || !s.active) { s.fetch_task = nullptr; vTaskDelete(nullptr); return; }
+    if (n) { memcpy(s.videos, tmp, sizeof(bili_video_t) * n); s.count = n; schedule_list(); }
+    else {
         Application::GetInstance().Schedule([]() {
             emote_handle_t h = get_emote_handle();
             if (!h) return;
-            emote_lock(h);
-            if (init_ui_locked(h)) {
-                clear_all_locked();
-                enter_bili_locked(h);
-                set_text(s.page, "", 0x202020, 0, 0, 360, 360, 0xF4F4F4, true);
-                set_text(s.header, "哔哩哔哩", 0xFFFFFF, 0, 0, 360, 42, 0xFB7299, true);
-                set_text(s.tabs, "B站数据获取失败，请检查电脑代理", 0xCC4444, 10, 54, 340, 32, 0xF4F4F4, true);
-                show(s.page); show(s.header); show(s.tabs);
-                emote_notify_all_refresh(h);
-            }
-            emote_unlock(h);
+            emote_lock(h); if (s.inited && s.active) show_error_locked(h, "无法获取视频列表"); emote_unlock(h);
         });
     }
-
     s.fetch_task = nullptr;
-    ESP_LOGI(TAG, "[Fetch] task exit");
     vTaskDelete(nullptr);
 }
 
 } // namespace
 
-extern "C" void vocat_bilibili_render_screen_async(void)
-{
-    if (s.active) {
-        ESP_LOGI(TAG, "[UI] Bilibili already active");
-        return;
-    }
-
+extern "C" void vocat_bilibili_render_screen_async(void) {
+    if (s.active || s.fetch_task) return;
+    ++s.generation;
+    s.active = true; s.player = false; s.view = View::Loading; s.selected = -1;
     Application::GetInstance().Schedule([]() {
         emote_handle_t h = get_emote_handle();
         if (!h) return;
-        emote_lock(h);
-        if (init_ui_locked(h)) show_loading_locked(h);
-        emote_unlock(h);
+        emote_lock(h); if (init_locked(h)) show_loading_locked(h); emote_unlock(h);
     });
-
-    if (s.fetch_task != nullptr) return;
-
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        fetch_task,
-        "bili_fetch",
-        BILI_TASK_STACK_SIZE,
-        nullptr,
-        3,
-        &s.fetch_task,
-        1
-    );
-
-    if (ret != pdPASS) {
+    if (xTaskCreatePinnedToCore(fetch_task, "bili_fetch", BILI_TASK_STACK_SIZE, nullptr, 3, &s.fetch_task, 1) != pdPASS) {
         s.fetch_task = nullptr;
-        ESP_LOGE(TAG, "[Fetch] create task failed");
+        Application::GetInstance().Schedule([]() {
+            emote_handle_t h = get_emote_handle(); if (!h) return;
+            emote_lock(h); if (s.inited) show_error_locked(h, "界面加载失败"); emote_unlock(h);
+        });
     }
 }
 
-extern "C" void vocat_bilibili_ui_clear(void)
-{
-    s.stop_player = true;
-    stop_bili_audio();
+extern "C" bool vocat_bilibili_render_screen(void) { vocat_bilibili_render_screen_async(); return true; }
+extern "C" void vocat_bilibili_ui_clear(void) { exit_bilibili_async(); }
 
-    Application::GetInstance().Schedule([]() {
-        emote_handle_t h = get_emote_handle();
-        if (!h) return;
-
-        emote_lock(h);
-        if (s.inited) {
-            clear_all_locked();
-            s.active = false;
-            s.player = false;
-            s.selected = -1;
-            emote_stop_anim_dialog(h);
-            emote_notify_all_refresh(h);
-        }
-        emote_unlock(h);
-    });
-}
-
-extern "C" bool vocat_bilibili_ui_handle_touch(int x, int y)
-{
+extern "C" bool vocat_bilibili_ui_handle_touch(int x, int y) {
+    ESP_LOGI(TAG, "[TOUCH] x=%d y=%d view=%d active=%d", x, y, (int)s.view, s.active ? 1 : 0);
     if (!s.active) return false;
 
-    ESP_LOGI(TAG, "[Touch] x=%d y=%d player=%d selected=%d", x, y, s.player, s.selected);
-
-    if (s.player) {
-        if (x <= 100 && y <= 50) {
-            s.stop_player = true;
-            stop_bili_audio();
-            Application::GetInstance().Schedule([]() {
-                emote_handle_t h = get_emote_handle();
-                if (!h) return;
-                emote_lock(h);
-                if (init_ui_locked(h)) show_list_locked(h);
-                emote_unlock(h);
-            });
-            return true;
-        }
+    if (s.view == View::Player && hit(x, y, PLAYER_BACK_X - 8, PLAYER_BACK_Y - 8, PLAYER_BACK_SIZE + 16, PLAYER_BACK_SIZE + 16)) {
+        ESP_LOGI(TAG, "[TOUCH] player back -> nonblocking stop + list");
+        bili_player_stop();
+        schedule_list();
         return true;
     }
 
-    if (y >= 80 && y < 80 + BILI_ROW_COUNT * 68) {
-        int idx = (y - 80) / 68;
-        if (idx >= 0 && idx < s.count) {
-            ESP_LOGI(TAG, "[Touch] select row=%d bvid=%s", idx, s.videos[idx].bvid);
-            schedule_player(idx);
-        }
+    if (s.view != View::Player && hit(x, y, 148, 0, 64, 58)) {
+        exit_bilibili_async();
+        return true;
+    }
+    if (hit(x, y, 296, 0, 52, 52)) {
+        exit_bilibili_async();
         return true;
     }
 
-    // When Bilibili is active, swallow every touch so ToggleChatState is not called.
+    if (s.view == View::Player) return true;
+
+    if (s.view == View::List) {
+        for (int i = 0; i < BILI_ROW_COUNT; ++i) {
+            const int y0 = LIST_START_Y + i * (LIST_ROW_H + LIST_ROW_GAP);
+            if (hit(x, y, LIST_ROW_X, y0, LIST_ROW_W, LIST_ROW_H) && i < s.count) {
+                const int idx = i;
+                const uint32_t gen = s.generation;
+                Application::GetInstance().Schedule([idx, gen]() {
+                    if (!s.active || gen != s.generation) return;
+                    emote_handle_t h = get_emote_handle(); if (!h) return;
+                    emote_lock(h); if (s.inited) show_player_locked(h, idx); emote_unlock(h);
+                    bili_player_start(s.videos[idx].bvid, player_frame_cb, player_status_cb, nullptr);
+                });
+                return true;
+            }
+        }
+    }
     return true;
 }
 
-extern "C" void vocat_bilibili_ui_draw(const bili_video_t *videos, uint8_t count)
-{
+extern "C" void vocat_bilibili_ui_draw(const bili_video_t *videos, uint8_t count) {
     if (!videos) return;
-    if (count > BILI_RECORD_MAX) count = BILI_RECORD_MAX;
-
+    count = std::min<uint8_t>(count, BILI_RECORD_MAX);
     memcpy(s.videos, videos, sizeof(bili_video_t) * count);
     s.count = count;
     schedule_list();
 }
-
-extern "C" bool vocat_bilibili_render_screen(void)
-{
-    vocat_bilibili_render_screen_async();
-    return true;
-}
-
-extern "C" bool vocat_bilibili_ui_is_active(void)
-{
-    return s.active;
-}
+extern "C" bool vocat_bilibili_ui_is_active(void) { return s.active; }

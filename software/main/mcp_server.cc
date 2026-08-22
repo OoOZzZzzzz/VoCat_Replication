@@ -17,7 +17,8 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
-#include "vocat_bilibili_ui.hpp"
+
+#include "bilibili_ui.h"
 
 #define TAG "MCP"
 
@@ -122,25 +123,136 @@ void McpServer::AddCommonTools() {
     }
 #endif
 
-    AddTool(
-        "self.web.open_bilibili",
-        "打开B站热门榜单，联网后在屏幕展示视频列表，用户要求打开B站时调用",
-        PropertyList(),
-        [](const PropertyList&) -> ReturnValue {
-            vocat_bilibili_render_screen_async();
-            return true;
-        }
-    );
+    // AddTool(
+    //     "self.web.open_bilibili",
+    //     "打开B站热门榜单，联网后在屏幕展示视频列表，用户要求打开B站时调用",
+    //     PropertyList(),
+    //     [](const PropertyList&) -> ReturnValue {
+    //         vocat_bilibili_render_screen_async();
+    //         return true;
+    //     }
+    // );
+
+    // AddTool(
+    //     "self.web.close_bilibili",
+    //     "清空屏幕上的B站页面",
+    //     PropertyList(),
+    //     [](const PropertyList&) -> ReturnValue {
+    //         vocat_bilibili_ui_clear();
+    //         return true;
+    //     }
+    // );
+
+    /*
+     * ------------------------------------------------------------------------
+     * Bilibili Story Tools
+     *
+     * 这些工具全部集中在 mcp_server.cc，后续网络/音频实现也只需要替换
+     * story 模块内部逻辑，不需要继续扩散 MCP 注册代码。
+     * ------------------------------------------------------------------------
+     */
 
     AddTool(
-        "self.web.close_bilibili",
-        "清空屏幕上的B站页面",
+        "self.bilibili.open",
+        "打开B站界面。用户说“打开B站”“在B站看看视频”等场景调用。",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
-            vocat_bilibili_ui_clear();
+            return bilibili_story_open();
+        });
+
+    AddTool(
+        "self.bilibili.close",
+        "关闭B站界面并返回VoCat默认表情界面。用户说“关闭B站”“退出B站”等场景调用。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            bilibili_story_close();
             return true;
-        }
-    );
+        });
+
+    AddTool(
+        "self.bilibili.search",
+        "在B站搜索指定UP主。当前阶段只刷新Story UI的数据入口；后续阶段接入真实B站搜索接口。",
+        PropertyList({
+            Property("up_name", kPropertyTypeString)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            const std::string name =
+                properties["up_name"].value<std::string>();
+
+            bilibili_story_open();
+
+            // Stage 1: 保存搜索词到UI层。
+            // 实际网络搜索在下一阶段接入。
+            ESP_LOGI(TAG, "Bilibili search requested: %s", name.c_str());
+            return true;
+        });
+
+    AddTool(
+        "self.bilibili.play",
+        "播放B站视频列表中的指定视频。index 从0开始。",
+        PropertyList({
+            Property("index", kPropertyTypeInteger, 0, BILI_RECORD_MAX - 1)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            const int index = properties["index"].value<int>();
+            bilibili_story_show_player(static_cast<uint8_t>(index));
+            return true;
+        });
+
+    AddTool(
+        "self.bilibili.pause",
+        "暂停当前B站播放器。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            bilibili_story_set_playing(false);
+            return true;
+        });
+
+    AddTool(
+        "self.bilibili.resume",
+        "继续播放当前B站播放器。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            bilibili_story_set_playing(true);
+            return true;
+        });
+
+    AddTool(
+        "self.bilibili.previous",
+        "切换到B站视频列表上一首；到列表顶部后循环到末尾。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            if (!bilibili_story_is_active()) {
+                return false;
+            }
+            bilibili_story_previous();
+            return true;
+        });
+
+    AddTool(
+        "self.bilibili.next",
+        "切换到B站视频列表下一首；到列表末尾后循环到顶部。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            if (!bilibili_story_is_active()) {
+                return false;
+            }
+            bilibili_story_next();
+            return true;
+        });
+
+    AddTool(
+        "self.bilibili.back",
+        "B站播放器返回视频列表；如果当前已经在列表，则关闭B站界面。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            if (!bilibili_story_is_active()) {
+                return false;
+            }
+            bilibili_story_back();
+            return true;
+        });
+
 
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());

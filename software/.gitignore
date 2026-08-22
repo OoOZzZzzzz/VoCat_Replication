@@ -22,3 +22,4 @@ mmap_generate_*.h
 main/custom/servers/bili_cache.json
 main/custom/servers/vbilibili_server.py
 bili_cache.json
+Tools/

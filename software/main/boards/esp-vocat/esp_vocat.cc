@@ -1,5 +1,5 @@
 #include "application.h"
-#include "custom/vocat_bilibili_ui.hpp"
+#include "bilibili/story/bilibili_ui.h"
 #include "backlight.h"
 #include "button.h"
 #include "codecs/box_audio_codec.h"

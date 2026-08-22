@@ -41,12 +41,11 @@ set(SOURCES "audio/audio_codec.cc"
             "assets.cc"
             "main.cc"
 
-            "custom/vocat_bilibili.c"
-            "custom/vocat_bilibili_ui.cpp"
-            "custom/bili_h264_player.cpp"
+            "bilibili/vocat_bilibili.c"
+            "bilibili/story/bilibili_ui.cpp"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "custom")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "bilibili" "bilibili/story")
 
 # Add board common files
 list(APPEND SOURCES

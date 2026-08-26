@@ -154,10 +154,16 @@ void McpServer::AddCommonTools() {
 
     AddTool(
         "self.bilibili.open",
-        "打开B站界面。用户说“打开B站”“在B站看看视频”等场景调用。",
+        "打开B站并默认搜索小约翰可汗。用户说打开B站或播放B站时调用。",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
-            return bilibili_story_open();
+            ESP_LOGI(TAG, "[BILI][MCP] open");
+            if (!bilibili_story_open()) {
+                ESP_LOGE(TAG, "[BILI][MCP] open failed");
+                return false;
+            }
+            bilibili_story_search("小约翰可汗");
+            return true;
         });
 
     AddTool(
@@ -171,19 +177,17 @@ void McpServer::AddCommonTools() {
 
     AddTool(
         "self.bilibili.search",
-        "在B站搜索指定UP主。当前阶段只刷新Story UI的数据入口；后续阶段接入真实B站搜索接口。",
+        "在B站搜索UP主并刷新其视频列表。用户说搜索某某或在B站搜索某某时调用。",
         PropertyList({
             Property("up_name", kPropertyTypeString)
         }),
         [](const PropertyList& properties) -> ReturnValue {
-            const std::string name =
-                properties["up_name"].value<std::string>();
-
-            bilibili_story_open();
-
-            // Stage 1: 保存搜索词到UI层。
-            // 实际网络搜索在下一阶段接入。
-            ESP_LOGI(TAG, "Bilibili search requested: %s", name.c_str());
+            const std::string name = properties["up_name"].value<std::string>();
+            ESP_LOGI(TAG, "[BILI][MCP] search up_name=%s", name.c_str());
+            if (!bilibili_story_is_active() && !bilibili_story_open()) {
+                return false;
+            }
+            bilibili_story_search(name.c_str());
             return true;
         });
 

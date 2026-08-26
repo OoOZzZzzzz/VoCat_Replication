@@ -42,7 +42,9 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
 
             "bilibili/vocat_bilibili.c"
-            "bilibili/story/bilibili_ui.cpp"
+            "bilibili/story/bilibili_ui_legacy.cpp"
+            "bilibili/story/bilibili_audio.cpp"
+            # "bilibili/story/bilibili_ui_lvgl.cpp"
             )
 
 set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "bilibili" "bilibili/story")

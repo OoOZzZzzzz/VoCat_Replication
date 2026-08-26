@@ -1,4 +1,5 @@
 #include "bilibili_ui.h"
+#include "bilibili_audio.h"
 
 #include <algorithm>
 #include <cstring>
@@ -27,6 +28,7 @@ constexpr int LIST_Y = 60;
 constexpr int LIST_W = 324;
 constexpr int ROW_H = 63;
 constexpr int ROW_GAP = 6;
+constexpr int LIST_VISIBLE = 4;
 
 constexpr int PLAYER_BACK_X = 24;
 constexpr int PLAYER_BACK_Y = 10;
@@ -64,6 +66,7 @@ struct State {
     bili_video_t videos[BILI_RECORD_MAX] = {};
     uint8_t count = 0;
     uint8_t selected = 0;
+    uint8_t scroll = 0;
 
     char search_name[64] = {};
 
@@ -272,49 +275,27 @@ static void draw_header(const char *heading) {
 
 static void draw_list() {
     hide_page_objects();
-
-    set_label(s.root, "", 0,
-              0, 0, UI_W, UI_H,
-              0xF1F3F6, true);
-
+    set_label(s.root, "", 0, 0, 0, UI_W, UI_H, 0xF1F3F6, true);
     char heading[96];
-    if (s.search_name[0] != '\0') {
-        snprintf(heading, sizeof(heading), "Bilibili · %s", s.search_name);
-    } else {
-        snprintf(heading, sizeof(heading), "Bilibili");
-    }
-
+    if (s.search_name[0] != '\0') snprintf(heading, sizeof(heading), "Bilibili · %s", s.search_name);
+    else snprintf(heading, sizeof(heading), "Bilibili");
     draw_header(heading);
-
     if (s.count == 0) {
-        set_label(s.rows[0], "暂无视频",
-                  0x69717D,
-                  72, 150, 216, 44,
-                  0xFFFFFF, true);
+        set_label(s.rows[0], "暂无视频", 0x69717D, 72, 150, 216, 44, 0xFFFFFF, true);
+        set_visible(s.rows[0], true);
     } else {
-        for (uint8_t i = 0; i < s.count; ++i) {
-            const int y = LIST_Y + i * (ROW_H + ROW_GAP);
-            std::string title = clip_utf8(s.videos[i].title, 24);
-
+        for (uint8_t slot = 0; slot < LIST_VISIBLE; ++slot) {
+            const uint8_t index = static_cast<uint8_t>(s.scroll + slot);
+            if (index >= s.count) break;
+            const int y = LIST_Y + slot * (ROW_H + ROW_GAP);
+            const std::string title = clip_utf8(s.videos[index].title, 24);
             char line[180];
-            snprintf(line, sizeof(line),
-                     "%s\n%lu 次播放",
-                     title.c_str(),
-                     static_cast<unsigned long>(s.videos[i].play_count));
-
-            const uint32_t bg = (i == s.selected)
-                                    ? 0xFFF0F5
-                                    : 0xFFFFFF;
-
-            set_label(s.rows[i], line,
-                      0x23282F,
-                      LIST_X, y, LIST_W, ROW_H,
-                      bg, true);
-
-            gfx_label_set_long_mode(s.rows[i], GFX_LABEL_LONG_WRAP);
+            snprintf(line, sizeof(line), "%s\n%lu 次播放", title.c_str(), static_cast<unsigned long>(s.videos[index].play_count));
+            const uint32_t bg = (index == s.selected) ? 0xFFF0F5 : 0xFFFFFF;
+            set_label(s.rows[slot], line, 0x23282F, LIST_X, y, LIST_W, ROW_H, bg, true);
+            gfx_label_set_long_mode(s.rows[slot], GFX_LABEL_LONG_WRAP);
         }
     }
-
     set_visible(s.root, true);
 }
 
@@ -416,33 +397,14 @@ static void refresh() {
     emote_unlock(h);
 }
 
-static void load_stage1_demo_data() {
-    /*
-     * Stage 1 intentionally uses local demo data.
-     * Stage 2 will replace this with B站 UP 主搜索结果.
-     */
-    static const char *titles[] = {
-        "示例视频 01 · B站音频播放器 UI",
-        "示例视频 02 · ESP32 网络音频设计",
-        "示例视频 03 · VoCat 项目开发记录",
-        "示例视频 04 · 今日推荐内容",
-    };
+static void audio_eof_cb(void *) {
+    Application::GetInstance().Schedule([]() {
+        if (s.active && s.page == Page::Player) bilibili_story_next();
+    });
+}
 
-    s.count = BILI_RECORD_MAX;
-
-    for (uint8_t i = 0; i < s.count; ++i) {
-        memset(&s.videos[i], 0, sizeof(s.videos[i]));
-
-        strncpy(s.videos[i].title,
-                titles[i],
-                BILI_TITLE_MAX_LEN);
-
-        s.videos[i].play_count = 1000 + i * 250;
-        snprintf(s.videos[i].bvid,
-                 BILI_BVID_MAX_LEN,
-                 "STAGE1%u",
-                 static_cast<unsigned>(i));
-    }
+static bool start_audio_for_selected() {
+    return s.selected < s.count && bilibili_audio_start(s.videos[s.selected].bvid, audio_eof_cb, nullptr);
 }
 
 }  // namespace
@@ -456,6 +418,9 @@ extern "C" bool bilibili_story_open(void) {
     s.page = Page::List;
     s.playing = false;
     s.selected = 0;
+    s.scroll = 0;
+    s.count = 0;
+    bilibili_audio_stop();
 
     Application::GetInstance().Schedule([]() {
         emote_handle_t h = get_emote_handle();
@@ -472,7 +437,6 @@ extern "C" bool bilibili_story_open(void) {
             return;
         }
 
-        load_stage1_demo_data();
         draw_list();
 
         emote_notify_all_refresh(h);
@@ -483,6 +447,7 @@ extern "C" bool bilibili_story_open(void) {
 }
 
 extern "C" void bilibili_story_close(void) {
+    bilibili_audio_stop();
     s.active = false;
     s.page = Page::Closed;
     s.playing = false;
@@ -507,6 +472,17 @@ extern "C" bool bilibili_story_is_active(void) {
     return s.active;
 }
 
+extern "C" void bilibili_story_search(const char *up_name) {
+    if (!up_name || up_name[0] == '\0') return;
+    if (!s.active && !bilibili_story_open()) return;
+    strncpy(s.search_name, up_name, sizeof(s.search_name)-1);
+    s.search_name[sizeof(s.search_name)-1] = '\0';
+    bilibili_audio_stop();
+    bili_video_t results[BILI_RECORD_MAX] = {};
+    const uint8_t count = vocat_bilibili_search_up(up_name, results, BILI_RECORD_MAX);
+    bilibili_story_show_list(results, count);
+}
+
 extern "C" void bilibili_story_show_list(const bili_video_t *videos,
                                           uint8_t count) {
     if (!s.active) {
@@ -524,8 +500,10 @@ extern "C" void bilibili_story_show_list(const bili_video_t *videos,
         s.selected = 0;
     }
 
+    bilibili_audio_stop();
     s.page = Page::List;
     s.playing = false;
+    s.scroll = 0;
 
     refresh();
 }
@@ -535,9 +513,10 @@ extern "C" void bilibili_story_show_player(uint8_t index) {
         return;
     }
 
+    bilibili_audio_stop();
     s.selected = index;
     s.page = Page::Player;
-    s.playing = true;
+    s.playing = start_audio_for_selected();
 
     refresh();
 }
@@ -548,6 +527,7 @@ extern "C" void bilibili_story_set_playing(bool playing) {
     }
 
     s.playing = playing;
+    bilibili_audio_set_paused(!playing);
     refresh();
 }
 
@@ -556,39 +536,17 @@ extern "C" void bilibili_story_set_track(uint8_t index) {
         return;
     }
 
-    s.selected = index;
-    s.page = Page::Player;
-    s.playing = true;
-
-    refresh();
+    bilibili_story_show_player(index);
 }
 
 extern "C" void bilibili_story_previous(void) {
-    if (!s.active || s.count == 0) {
-        return;
-    }
-
-    if (s.page != Page::Player) {
-        s.page = Page::Player;
-    }
-
-    s.selected = (s.selected == 0) ? (s.count - 1) : (s.selected - 1);
-    s.playing = true;
-    refresh();
+    if (!s.active || s.count == 0) return;
+    bilibili_story_show_player(s.selected == 0 ? static_cast<uint8_t>(s.count-1) : static_cast<uint8_t>(s.selected-1));
 }
 
 extern "C" void bilibili_story_next(void) {
-    if (!s.active || s.count == 0) {
-        return;
-    }
-
-    if (s.page != Page::Player) {
-        s.page = Page::Player;
-    }
-
-    s.selected = (s.selected + 1) % s.count;
-    s.playing = true;
-    refresh();
+    if (!s.active || s.count == 0) return;
+    bilibili_story_show_player(static_cast<uint8_t>((s.selected + 1) % s.count));
 }
 
 extern "C" void bilibili_story_back(void) {
@@ -597,6 +555,7 @@ extern "C" void bilibili_story_back(void) {
     }
 
     if (s.page == Page::Player) {
+        bilibili_audio_stop();
         s.page = Page::List;
         s.playing = false;
         refresh();
@@ -624,8 +583,10 @@ extern "C" bool bilibili_story_handle_touch(int x, int y) {
             return true;
         }
 
-        for (uint8_t i = 0; i < s.count; ++i) {
-            const int row_y = LIST_Y + i * (ROW_H + ROW_GAP);
+        for (uint8_t slot = 0; slot < LIST_VISIBLE; ++slot) {
+            const uint8_t i = static_cast<uint8_t>(s.scroll + slot);
+            if (i >= s.count) break;
+            const int row_y = LIST_Y + slot * (ROW_H + ROW_GAP);
 
             if (inside(x, y,
                        LIST_X, row_y,
@@ -669,8 +630,7 @@ extern "C" bool bilibili_story_handle_touch(int x, int y) {
                    CTRL_Y - 7,
                    CTRL_S + 14,
                    CTRL_S + 14)) {
-            s.playing = !s.playing;
-            refresh();
+            bilibili_story_set_playing(!s.playing);
             return true;
         }
 
@@ -686,6 +646,16 @@ extern "C" bool bilibili_story_handle_touch(int x, int y) {
         return true;
     }
 
+    return true;
+}
+
+extern "C" bool bilibili_story_handle_swipe(int, int start_y, int, int end_y) {
+    if (!s.active || s.page != Page::List || s.count <= LIST_VISIBLE) return false;
+    const int dy = end_y - start_y;
+    if (std::abs(dy) < 20) return false;
+    if (dy < 0 && s.scroll + LIST_VISIBLE < s.count) ++s.scroll;
+    else if (dy > 0 && s.scroll > 0) --s.scroll;
+    refresh();
     return true;
 }
 

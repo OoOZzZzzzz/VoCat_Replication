@@ -21,7 +21,6 @@
 // FreeRTOS headers
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-
 // Project headers
 #include "assets/lang_config.h"
 #include "assets.h"
@@ -37,7 +36,6 @@ namespace emote {
 // ============================================================================
 
 static const char* TAG = "EmoteDisplay";
-
 // ============================================================================
 // Forward Declarations
 // ============================================================================
@@ -47,7 +45,6 @@ class EmoteDisplay;
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
 static bool OnFlushIoReady(const esp_lcd_panel_io_handle_t panel_io,
     esp_lcd_panel_io_event_data_t* const edata, void* user_ctx)
 {
@@ -55,18 +52,30 @@ static bool OnFlushIoReady(const esp_lcd_panel_io_handle_t panel_io,
     if (handle) {
         emote_notify_flush_finished(handle);
     }
+    if (handle && EmoteDisplay::GetInstance()) {
+        EmoteDisplay::GetInstance()->NotifyFlushDone();
+    }
     return true;
 }
-
 // Flush callback for emote
 static void OnFlushCallback(int x_start, int y_start, int x_end, int y_end, const void* data, emote_handle_t handle)
 {
+    if (EmoteDisplay::GetInstance() && EmoteDisplay::GetInstance()->IsExternalDisplayMode()) {
+        emote_notify_flush_finished(handle);
+        return;
+    }
+
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)emote_get_user_data(handle);
     if (panel != nullptr) {
-        esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, data);
+        if (EmoteDisplay::GetInstance()) {
+            EmoteDisplay::GetInstance()->MarkFlushPending();
+        }
+        esp_err_t err = esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, data);
+        if (err != ESP_OK && EmoteDisplay::GetInstance()) {
+            EmoteDisplay::GetInstance()->NotifyFlushDone();
+        }
     }
 }
-
 // ============================================================================
 // Graphics Initialization Functions
 // ============================================================================
@@ -77,7 +86,6 @@ static emote_handle_t InitializeEmote(const esp_lcd_panel_handle_t panel, const 
         ESP_LOGE(TAG, "Invalid panel");
         return nullptr;
     }
-
     emote_config_t emote_cfg = {
         .flags = {
             .swap = true,
@@ -101,7 +109,6 @@ static emote_handle_t InitializeEmote(const esp_lcd_panel_handle_t panel, const 
         .flush_cb = OnFlushCallback,
         .user_data = (void*)panel,
     };
-
     emote_handle_t emote_handle = emote_init(&emote_cfg);
     if (!emote_handle) {
         ESP_LOGE(TAG, "Failed to initialize emote");
@@ -115,22 +122,71 @@ static emote_handle_t InitializeEmote(const esp_lcd_panel_handle_t panel, const 
 // EmoteDisplay Class Implementation
 // ============================================================================
 
+static EmoteDisplay* g_emote_display_instance = nullptr;
+
 EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel, const esp_lcd_panel_io_handle_t panel_io,
                            const int width, const int height)
 {
     emote_handle_ = InitializeEmote(panel, width, height);
+    panel_io_ = panel_io;
+    g_emote_display_instance = this;
 
     const esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = OnFlushIoReady,
     };
     esp_lcd_panel_io_register_event_callbacks(panel_io, &cbs, emote_handle_);
 }
-
 EmoteDisplay::~EmoteDisplay()
 {
+    external_display_mode_.store(false);
+    external_flush_done_callback_.store(nullptr);
+    external_flush_done_context_.store(nullptr);
+
     if (emote_handle_) {
         emote_deinit(emote_handle_);
         emote_handle_ = nullptr;
+    }
+    if (g_emote_display_instance == this) {
+        g_emote_display_instance = nullptr;
+    }
+}
+void EmoteDisplay::SetExternalDisplayMode(bool enabled)
+{
+    ESP_LOGI(TAG, "SetExternalDisplayMode: %s", enabled ? "ON" : "OFF");
+    external_display_mode_.store(enabled);
+}
+void EmoteDisplay::SetExternalFlushDoneCallback(ExternalFlushDoneCallback callback, void* context)
+{
+    external_flush_done_context_.store(context);
+    external_flush_done_callback_.store(callback);
+}
+bool EmoteDisplay::WaitForFlushIdle(int timeout_ms)
+{
+    const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
+    while (pending_flushes_.load() != 0) {
+        if (esp_timer_get_time() >= deadline) {
+            ESP_LOGE(TAG, "WaitForFlushIdle timeout, pending=%" PRIu32, pending_flushes_.load());
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return true;
+}
+void EmoteDisplay::MarkFlushPending()
+{
+    pending_flushes_.fetch_add(1);
+}
+void EmoteDisplay::NotifyFlushDone()
+{
+    uint32_t pending = pending_flushes_.load();
+    while (pending != 0 &&
+           !pending_flushes_.compare_exchange_weak(pending, pending - 1)) {
+    }
+
+    ExternalFlushDoneCallback callback = external_flush_done_callback_.load();
+    void* context = external_flush_done_context_.load();
+    if (callback != nullptr) {
+        callback(context);
     }
 }
 
@@ -141,7 +197,6 @@ void EmoteDisplay::SetEmotion(const char* const emotion)
         emote_set_anim_emoji(emote_handle_, emotion);
     }
 }
-
 void EmoteDisplay::SetChatMessage(const char* const role, const char* const content)
 {
     ESP_LOGI(TAG, "SetChatMessage: %s, %s", role, content);
@@ -158,7 +213,6 @@ void EmoteDisplay::SetChatMessage(const char* const role, const char* const cont
         }
     }
 }
-
 void EmoteDisplay::SetStatus(const char* const status)
 {
     ESP_LOGI(TAG, "SetStatus: %s", status);
@@ -174,7 +228,6 @@ void EmoteDisplay::SetStatus(const char* const status)
         }
     }
 }
-
 void EmoteDisplay::ShowNotification(const char* notification, int duration_ms)
 {
     ESP_LOGI(TAG, "ShowNotification: %s", notification);
@@ -190,7 +243,6 @@ void EmoteDisplay::UpdateStatusBar(bool update_all)
         return;
     }
 }
-
 void EmoteDisplay::SetPowerSaveMode(bool on)
 {
     ESP_LOGI(TAG, "SetPowerSaveMode: %s", on ? "ON" : "OFF");
@@ -210,7 +262,6 @@ void EmoteDisplay::SetTheme(Theme* const theme)
 {
     ESP_LOGI(TAG, "SetTheme: %p", theme);
 }
-
 bool EmoteDisplay::Lock(const int timeout_ms)
 {
     (void)timeout_ms;
@@ -229,7 +280,6 @@ bool EmoteDisplay::StopAnimDialog()
     }
     return false;
 }
-
 bool EmoteDisplay::InsertAnimDialog(const char* emoji_name, uint32_t duration_ms)
 {
     ESP_LOGI(TAG, "InsertAnimDialog: %s, %" PRIu32, emoji_name, duration_ms);
@@ -245,6 +295,11 @@ void EmoteDisplay::RefreshAll()
         emote_notify_all_refresh(emote_handle_);
         return;
     }
+}
+
+EmoteDisplay* EmoteDisplay::GetInstance()
+{
+    return g_emote_display_instance;
 }
 
 } // namespace emote

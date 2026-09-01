@@ -712,11 +712,45 @@ private:
                 touchpad->UpdateTouchPoint();
                 auto touch_event = touchpad->CheckTouchEvent();
 
-                if (touch_event == Cst816s::TOUCH_RELEASE) {
-                    const auto& point = touchpad->GetTouchPoint();
-                    if (vocat_bilibili_ui_handle_touch(point.x, point.y)) {
-                        continue;
+                // if (touch_event == Cst816s::TOUCH_RELEASE) {
+                //     const auto& point = touchpad->GetTouchPoint();
+                //     if (vocat_bilibili_ui_handle_touch(point.x, point.y)) {
+                //         continue;
+                //     }
+                //     if (app.GetDeviceState() == kDeviceStateStarting) {
+                //         board.EnterWifiConfigMode();
+                //     } else {
+                //         app.ToggleChatState();
+                //     }
+                // }
+
+                if (touch_event == Cst816s::TOUCH_PRESS ||
+                    touch_event == Cst816s::TOUCH_HOLD ||
+                    touch_event == Cst816s::TOUCH_RELEASE) {
+                     const auto& point = touchpad->GetTouchPoint();
+
+                    int bili_event = 0;
+                    if (touch_event == Cst816s::TOUCH_PRESS) {
+                        bili_event = 1;
+                    } else if (touch_event == Cst816s::TOUCH_HOLD) {
+                        bili_event = 2;
                     }
+
+                    if (vocat_bilibili_ui_handle_touch_event(point.x, point.y, bili_event)) {
+                         continue;
+                     }
+
+
+                    if (touch_event == Cst816s::TOUCH_RELEASE) {
+                        if (app.GetDeviceState() == kDeviceStateStarting) {
+                            board.EnterWifiConfigMode();
+                        } else {
+                            app.ToggleChatState();
+                        }
+                    }
+                }
+
+                if (touch_event == Cst816s::TOUCH_RELEASE) {
                     if (app.GetDeviceState() == kDeviceStateStarting) {
                         board.EnterWifiConfigMode();
                     } else {

@@ -3,6 +3,9 @@
 
 #include <lvgl.h>
 
+#include <inttypes.h>
+#include <atomic>
+
 /* VoCat-local LVGL Music Player demo. */
 extern "C" {
 #include "music/lv_demo_music.h"
@@ -62,15 +65,27 @@ struct State {
 State s;
 SemaphoreHandle_t lvgl_mutex = nullptr;
 static TaskHandle_t lvgl_task = nullptr;
+static TaskHandle_t audio_policy_task = nullptr;
 static volatile bool lvgl_task_stop = false;
+static volatile bool audio_policy_task_stop = false;
+static std::atomic_bool touch_is_down(false);
+
+constexpr uint32_t AUDIO_NOTIFY_TOUCH_DOWN = 1U << 0;
+constexpr uint32_t AUDIO_NOTIFY_TOUCH_UP = 1U << 1;
+constexpr uint32_t AUDIO_NOTIFY_WAKE = 1U << 2;
 
 extern "C" bool vocat_lvgl_music_is_playing(void);
 
-constexpr uint32_t MUSIC_INTRO_BUSY_MS = 5200;
-constexpr uint32_t TOUCH_AUDIO_QUIET_MS = 700;
+constexpr uint32_t TOUCH_AUDIO_QUIET_MS = 1000;
+#if CONFIG_FREERTOS_UNICORE
+constexpr BaseType_t LVGL_CORE = 0;
+constexpr BaseType_t AUDIO_POLICY_CORE = 0;
+#else
+constexpr BaseType_t LVGL_CORE = 1;
+constexpr BaseType_t AUDIO_POLICY_CORE = 0;
+#endif
 
-static uint64_t audio_policy_busy_until_ms = 0;
-static uint64_t touch_audio_quiet_until_ms = 0;
+static std::atomic<uint32_t> touch_audio_quiet_until_ms{0};
 static bool audio_quiet_applied = false;
 static bool external_media_mode_applied = false;
 
@@ -474,8 +489,10 @@ static void music_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data)
     LV_UNUSED(indev);
 
     State::TouchSample sample;
-    if (s.touch_queue != nullptr && xQueueReceive(s.touch_queue, &sample, 0) == pdTRUE) {
-        s.last_touch = sample;
+    if (s.touch_queue != nullptr) {
+        while (xQueueReceive(s.touch_queue, &sample, 0) == pdTRUE) {
+            s.last_touch = sample;
+        }
     }
 
     data->point.x = s.last_touch.x;
@@ -490,7 +507,7 @@ static void create_music_input()
     }
 
     if (s.touch_queue == nullptr) {
-        s.touch_queue = xQueueCreate(32, sizeof(State::TouchSample));
+        s.touch_queue = xQueueCreate(1, sizeof(State::TouchSample));
         if (s.touch_queue == nullptr) {
             ESP_LOGE(TAG, "[INPUT] xQueueCreate failed");
             return;
@@ -540,9 +557,9 @@ static void create_music_ui()
              static_cast<void*>(s.root));
 }
 
-static uint64_t now_ms()
+static uint32_t now_ms()
 {
-    return static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+    return static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
 }
 
 static void restore_audio_after_quiet()
@@ -583,15 +600,23 @@ static void apply_audio_policy()
         return;
     }
 
-    const uint64_t now = now_ms();
+    const uint32_t now = now_ms();
     const bool music_playing = vocat_lvgl_music_is_playing();
-    const bool ui_busy = now < audio_policy_busy_until_ms;
-    const bool touch_busy = now < touch_audio_quiet_until_ms;
+    const uint32_t touch_quiet_until = touch_audio_quiet_until_ms.load(std::memory_order_acquire);
+    const bool touch_busy = touch_is_down.load(std::memory_order_acquire) ||
+                            static_cast<int32_t>(touch_quiet_until - now) > 0;
 
+    /*
+     * Music owns the audio path. While a user is pausing/stopping music by
+     * touch, keep external-media mode until the touch quiet window expires;
+     * this avoids a rapid external-media -> AFE -> external-media sequence.
+     */
     if (music_playing) {
         if (!external_media_mode_applied) {
-            ESP_LOGI(TAG, "[AUDIO] entering external media mode (Music Player playing)");
+            ESP_LOGI(TAG, "[AUDIO] music active -> disabling AI audio pipeline");
+            const int64_t t0 = esp_timer_get_time();
             Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(true);
+            ESP_LOGI(TAG, "[AUDIO] external media ON took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
             external_media_mode_applied = true;
             audio_quiet_applied = false;
         }
@@ -599,45 +624,142 @@ static void apply_audio_policy()
     }
 
     if (external_media_mode_applied) {
-        ESP_LOGI(TAG, "[AUDIO] leaving external media mode (Music Player paused)");
+        if (touch_busy) {
+            return;
+        }
+
+        ESP_LOGI(TAG, "[AUDIO] music stopped and touch idle -> leaving external media mode");
+        const int64_t t0 = esp_timer_get_time();
         restore_audio_after_quiet();
+        ESP_LOGI(TAG, "[AUDIO] external media OFF/AFE restore took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
         return;
     }
 
-    const bool quiet = ui_busy || touch_busy;
-
-    if (quiet) {
+    if (touch_busy) {
         if (!audio_quiet_applied) {
-            ESP_LOGI(TAG, "[AUDIO] temporarily pausing AFE (ui_busy=%d touch_busy=%d)",
-                     ui_busy ? 1 : 0,
-                     touch_busy ? 1 : 0);
+            ESP_LOGI(TAG, "[AUDIO] touch active -> temporarily disabling AI audio pipeline");
             auto& audio = Application::GetInstance().GetAudioService();
+            const int64_t t0 = esp_timer_get_time();
             audio.EnableVoiceProcessing(false);
             audio.EnableWakeWordDetection(false);
+            ESP_LOGI(TAG, "[AUDIO] AI audio OFF took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
             audio_quiet_applied = true;
         }
-    } else if (audio_quiet_applied) {
-        ESP_LOGI(TAG, "[AUDIO] restoring AFE after UI activity");
+    }
+    else if (audio_quiet_applied) {
+        ESP_LOGI(TAG, "[AUDIO] touch idle -> restoring AI audio pipeline");
+        const int64_t t0 = esp_timer_get_time();
         restore_audio_after_quiet();
+        ESP_LOGI(TAG, "[AUDIO] AI audio restore took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
+    }
+}
+
+static void audio_policy_task_entry(void* arg)
+{
+    LV_UNUSED(arg);
+    ESP_LOGI(TAG, "[AUDIO] policy task started core=%d priority=%lu stack_free=%lu",
+             xPortGetCoreID(),
+             static_cast<unsigned long>(uxTaskPriorityGet(nullptr)),
+             static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)));
+
+    /* Reconcile AI state once at startup: no touch + no music means the normal
+     * Xiaozhi audio pipeline remains enabled. */
+    apply_audio_policy();
+
+    while (!audio_policy_task_stop) {
+        uint32_t notified = 0;
+        (void)xTaskNotifyWait(
+            0,
+            AUDIO_NOTIFY_TOUCH_DOWN | AUDIO_NOTIFY_TOUCH_UP | AUDIO_NOTIFY_WAKE,
+            &notified,
+            pdMS_TO_TICKS(50)
+        );
+
+        if((notified & AUDIO_NOTIFY_TOUCH_DOWN) != 0U ||
+           (notified & AUDIO_NOTIFY_TOUCH_UP) != 0U) {
+            touch_audio_quiet_until_ms.store(
+                now_ms() + TOUCH_AUDIO_QUIET_MS,
+                std::memory_order_release);
+        }
+
+        apply_audio_policy();
+    }
+
+    ESP_LOGI(TAG, "[AUDIO] policy task stopped");
+    audio_policy_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+static bool start_audio_policy_task()
+{
+    audio_policy_task_stop = false;
+
+    if (xTaskCreatePinnedToCore(
+            audio_policy_task_entry,
+            "bili_audio_policy",
+            4096,
+            nullptr,
+            2,
+            &audio_policy_task,
+            AUDIO_POLICY_CORE) != pdPASS) {
+        audio_policy_task = nullptr;
+        ESP_LOGE(TAG, "[AUDIO] failed to create policy task");
+        return false;
+    }
+
+    return true;
+}
+
+static void stop_audio_policy_task()
+{
+    if (audio_policy_task == nullptr) {
+        return;
+    }
+
+    audio_policy_task_stop = true;
+    (void)xTaskNotify(audio_policy_task, AUDIO_NOTIFY_WAKE, eSetBits);
+    for (int i = 0; i < 100 && audio_policy_task != nullptr; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 static void lvgl_task_entry(void* arg)
 {
     LV_UNUSED(arg);
-    ESP_LOGI(TAG, "[LVGL] UI task started");
+    ESP_LOGI(TAG, "[LVGL] UI task started core=%d priority=%lu stack_free=%lu",
+             xPortGetCoreID(),
+             static_cast<unsigned long>(uxTaskPriorityGet(nullptr)),
+             static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)));
+
+    uint32_t slow_frames = 0;
+    uint32_t last_slow_log_ms = 0;
 
     while (!lvgl_task_stop) {
-        uint32_t delay_ms = 20;
+        uint32_t delay_ms = 10;
         if (lock_lvgl(0)) {
             if (!lvgl_task_stop && s.display != nullptr) {
+                const int64_t start_us = esp_timer_get_time();
                 delay_ms = lv_timer_handler();
+                const int64_t elapsed_us = esp_timer_get_time() - start_us;
+
+                if (elapsed_us > 15000) {
+                    ++slow_frames;
+                    const uint32_t now_log_ms = now_ms();
+                    if (elapsed_us > 100000 ||
+                        static_cast<uint32_t>(now_log_ms - last_slow_log_ms) >= 500U) {
+                        last_slow_log_ms = now_log_ms;
+                        ESP_LOGW(TAG,
+                                 "[LVGL] slow frame=%" PRIi64 "us count=%lu",
+                                 elapsed_us,
+                                 static_cast<unsigned long>(slow_frames));
+                    }
+                }
+
                 if (delay_ms < 5) delay_ms = 5;
-                if (delay_ms > 20) delay_ms = 20;
+                if (delay_ms > 10) delay_ms = 10;
             }
             unlock_lvgl();
         }
-        apply_audio_policy();
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 
@@ -654,9 +776,9 @@ static bool start_lvgl_task()
             "bili_lvgl",
             8192,
             nullptr,
-            3,
+            4,
             &lvgl_task,
-            0) != pdPASS) {
+            LVGL_CORE) != pdPASS) {
         lvgl_task = nullptr;
         ESP_LOGE(TAG, "[LVGL] failed to create UI task");
         return false;
@@ -787,14 +909,8 @@ static bool push_touch_event(int x, int y, lv_indev_state_t state)
         state
     };
 
-    if (xQueueSend(s.touch_queue, &sample, 0) == pdTRUE) {
-        return true;
-    }
-
-    /* Drop one stale sample when a long drag fills the queue. */
-    State::TouchSample dropped;
-    (void)xQueueReceive(s.touch_queue, &dropped, 0);
-    return xQueueSend(s.touch_queue, &sample, 0) == pdTRUE;
+    /* Queue length is one by design: the newest point always wins. */
+    return xQueueOverwrite(s.touch_queue, &sample) == pdPASS;
 }
 
 }  // namespace
@@ -855,8 +971,8 @@ extern "C" bool bilibili_story_open(void)
         }
 
         s.active = true;
-        audio_policy_busy_until_ms = now_ms() + MUSIC_INTRO_BUSY_MS;
-        touch_audio_quiet_until_ms = 0;
+        touch_is_down.store(false, std::memory_order_release);
+        touch_audio_quiet_until_ms.store(0, std::memory_order_release);
         audio_quiet_applied = false;
         external_media_mode_applied = false;
 
@@ -869,6 +985,19 @@ extern "C" bool bilibili_story_open(void)
             break;
         }
 
+        if (!start_audio_policy_task()) {
+            ESP_LOGE(TAG, "[OPEN] audio policy task start failed");
+            s.active = false;
+            stop_lvgl_task();
+            destroy_lvgl_runtime();
+            release_emote_display();
+            restore_emote_ui();
+            break;
+        }
+
+        ESP_LOGI(TAG, "[OPEN] task split: LVGL core=%d priority=4, audio policy core=%d priority=2",
+                 static_cast<int>(LVGL_CORE),
+                 static_cast<int>(AUDIO_POLICY_CORE));
         ok = true;
     } while (false);
 
@@ -897,6 +1026,7 @@ extern "C" void bilibili_story_close(void)
 
     s.active = false;
 
+    stop_audio_policy_task();
     stop_lvgl_task();
 
     if (external_media_mode_applied) {
@@ -908,8 +1038,8 @@ extern "C" void bilibili_story_close(void)
         Application::GetInstance().GetAudioService().EnableWakeWordDetection(true);
         audio_quiet_applied = false;
     }
-    audio_policy_busy_until_ms = 0;
-    touch_audio_quiet_until_ms = 0;
+    touch_is_down.store(false, std::memory_order_release);
+    touch_audio_quiet_until_ms.store(0, std::memory_order_release);
 
     ESP_LOGI(TAG, "[CLOSE] clearing LVGL pixels before returning LCD ownership");
     (void)clear_panel_before_emote();
@@ -946,7 +1076,13 @@ extern "C" bool bilibili_story_handle_touch(int x, int y)
         return false;
     }
 
-    touch_audio_quiet_until_ms = now_ms() + TOUCH_AUDIO_QUIET_MS;
+    touch_is_down.store(false, std::memory_order_release);
+    touch_audio_quiet_until_ms.store(
+        now_ms() + TOUCH_AUDIO_QUIET_MS,
+        std::memory_order_release);
+    if(audio_policy_task != nullptr) {
+        (void)xTaskNotify(audio_policy_task, AUDIO_NOTIFY_TOUCH_UP, eSetBits);
+    }
     (void)push_touch_event(x, y, LV_INDEV_STATE_RELEASED);
 
     /* Keep all touch events inside the LVGL Music Player while Bilibili is active. */
@@ -959,11 +1095,22 @@ extern "C" bool vocat_bilibili_ui_handle_touch_event(int x, int y, int event)
         return false;
     }
 
-    touch_audio_quiet_until_ms = now_ms() + TOUCH_AUDIO_QUIET_MS;
-
     lv_indev_state_t state = LV_INDEV_STATE_RELEASED;
     if (event == 1 || event == 2) {
         state = LV_INDEV_STATE_PRESSED;
+        touch_is_down.store(true, std::memory_order_release);
+        if(audio_policy_task != nullptr) {
+            (void)xTaskNotify(audio_policy_task, AUDIO_NOTIFY_TOUCH_DOWN, eSetBits);
+        }
+    }
+    else {
+        touch_is_down.store(false, std::memory_order_release);
+        touch_audio_quiet_until_ms.store(
+            now_ms() + TOUCH_AUDIO_QUIET_MS,
+            std::memory_order_release);
+        if(audio_policy_task != nullptr) {
+            (void)xTaskNotify(audio_policy_task, AUDIO_NOTIFY_TOUCH_UP, eSetBits);
+        }
     }
 
     (void)push_touch_event(x, y, state);

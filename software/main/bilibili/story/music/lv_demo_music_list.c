@@ -132,8 +132,11 @@ lv_obj_t * vocat_lv_demo_music_list_create(lv_obj_t * parent)
     list = lv_obj_create(parent);
     lv_obj_add_event_cb(list, list_delete_event_cb, LV_EVENT_DELETE, NULL);
     lv_obj_remove_style_all(list);
-    lv_obj_set_size(list, lv_pct(100), lv_obj_get_content_height(parent) - LV_DEMO_MUSIC_HANDLE_SIZE);
-    lv_obj_set_y(list, LV_DEMO_MUSIC_HANDLE_SIZE);
+    lv_obj_set_size(list, lv_pct(100), 340);
+    lv_obj_set_y(list, 370);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_remove_flag(list, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_style(list, &style_scrollbar, LV_PART_SCROLLBAR);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
 
@@ -142,11 +145,7 @@ lv_obj_t * vocat_lv_demo_music_list_create(lv_obj_t * parent)
         add_list_button(list,  track_id);
     }
 
-#if LV_DEMO_MUSIC_ROUND
-    lv_obj_set_scroll_snap_y(list, LV_SCROLL_SNAP_CENTER);
-#endif
-
-    vocat_lv_demo_music_list_button_check(0, true);
+    vocat_lv_demo_music_list_button_check(0, false);
 
     return list;
 }
@@ -159,7 +158,7 @@ void vocat_lv_demo_music_list_button_check(uint32_t track_id, bool state)
     if(state) {
         lv_obj_add_state(btn, LV_STATE_CHECKED);
         lv_image_set_src(icon, &vocat_music_btn_list_pause);
-        lv_obj_scroll_to_view(btn, LV_ANIM_ON);
+        /* Do not animate the nested list here. The outer page controls the only page transition. */
     }
     else {
         lv_obj_remove_state(btn, LV_STATE_CHECKED);
@@ -234,6 +233,12 @@ static void btn_click_event_cb(lv_event_t * e)
     uint32_t idx = lv_obj_get_index(btn);
 
     vocat_lv_demo_music_play(idx);
+
+    lv_obj_t * page_root = lv_obj_get_parent(list);
+    if(page_root != NULL) {
+        lv_obj_set_style_anim_duration(page_root, 100, 0);
+        lv_obj_scroll_to_y(page_root, 0, LV_ANIM_ON);
+    }
 }
 
 static void list_delete_event_cb(lv_event_t * e)

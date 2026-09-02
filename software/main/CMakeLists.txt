@@ -46,9 +46,66 @@ set(SOURCES "audio/audio_codec.cc"
             "bilibili/story/bilibili_audio.cpp"
             "bilibili/story/bilibili_ui_lvgl.cpp"
             "bilibili/story/lvgl_music_demo.c"
+            "bilibili/story/music/lv_demo_music.c"
+            "bilibili/story/music/lv_demo_music_main.c"
+            "bilibili/story/music/lv_demo_music_list.c"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "bilibili" "bilibili/story")
+# VoCat-local copy of the LVGL Music Player demo.
+# Keep the asset source list explicit: ESP-IDF evaluates this component
+# CMakeLists.txt in its component-requirements script mode, where
+# file(GLOB ... CONFIGURE_DEPENDS) is not supported.
+list(APPEND SOURCES
+    "bilibili/story/music/lv_demo_music.c"
+    "bilibili/story/music/lv_demo_music_main.c"
+    "bilibili/story/music/lv_demo_music_list.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_corner_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_list_pause.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_list_pause_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_list_play.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_list_play_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_loop.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_loop_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_next.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_next_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_pause.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_pause_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_play.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_play_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_prev.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_prev_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_rnd.c"
+    "bilibili/story/music/assets/img_lv_demo_music_btn_rnd_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_corner_left.c"
+    "bilibili/story/music/assets/img_lv_demo_music_corner_left_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_corner_right.c"
+    "bilibili/story/music/assets/img_lv_demo_music_corner_right_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_cover_1.c"
+    "bilibili/story/music/assets/img_lv_demo_music_cover_1_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_cover_2.c"
+    "bilibili/story/music/assets/img_lv_demo_music_cover_2_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_cover_3.c"
+    "bilibili/story/music/assets/img_lv_demo_music_cover_3_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_icon_1.c"
+    "bilibili/story/music/assets/img_lv_demo_music_icon_1_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_icon_2.c"
+    "bilibili/story/music/assets/img_lv_demo_music_icon_2_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_icon_3.c"
+    "bilibili/story/music/assets/img_lv_demo_music_icon_3_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_icon_4.c"
+    "bilibili/story/music/assets/img_lv_demo_music_icon_4_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_list_border.c"
+    "bilibili/story/music/assets/img_lv_demo_music_list_border_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_logo.c"
+    "bilibili/story/music/assets/img_lv_demo_music_slider_knob.c"
+    "bilibili/story/music/assets/img_lv_demo_music_slider_knob_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_wave_bottom.c"
+    "bilibili/story/music/assets/img_lv_demo_music_wave_bottom_large.c"
+    "bilibili/story/music/assets/img_lv_demo_music_wave_top.c"
+    "bilibili/story/music/assets/img_lv_demo_music_wave_top_large.c"
+)
+
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "bilibili" "bilibili/story" "bilibili/story/music")
 
 # Add board common files
 list(APPEND SOURCES

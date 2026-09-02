@@ -3,24 +3,9 @@
 
 #include <lvgl.h>
 
-/* LVGL 9.5.0 Music Player demo is compiled as C in a separate translation unit. */
-#undef LV_BUILD_DEMOS
-#define LV_BUILD_DEMOS 1
-#undef LV_USE_DEMO_MUSIC
-#define LV_USE_DEMO_MUSIC 1
-#undef LV_DEMO_MUSIC_ROUND
-#define LV_DEMO_MUSIC_ROUND 1
-#undef LV_DEMO_MUSIC_SQUARE
-#define LV_DEMO_MUSIC_SQUARE 0
-#undef LV_DEMO_MUSIC_LANDSCAPE
-#define LV_DEMO_MUSIC_LANDSCAPE 0
-#undef LV_DEMO_MUSIC_LARGE
-#define LV_DEMO_MUSIC_LARGE 0
-#undef LV_DEMO_MUSIC_AUTO_PLAY
-#define LV_DEMO_MUSIC_AUTO_PLAY 0
-
+/* VoCat-local LVGL Music Player demo. */
 extern "C" {
-#include "../../../../managed_components/lvgl__lvgl/demos/music/lv_demo_music.h"
+#include "music/lv_demo_music.h"
 }
 
 #include <esp_heap_caps.h>
@@ -522,13 +507,13 @@ static void create_music_input()
     lv_indev_set_read_cb(s.indev, music_touch_read_cb);
     lv_indev_set_display(s.indev, s.display);
 
-    ESP_LOGI(TAG, "[INPUT] official Music Player pointer input created=%p",
+    ESP_LOGI(TAG, "[INPUT] local Music Player pointer input created=%p",
              static_cast<void*>(s.indev));
 }
 
 static void create_music_ui()
 {
-    ESP_LOGI(TAG, "[MUSIC] creating official LVGL 9.5 Music Player demo");
+    ESP_LOGI(TAG, "[MUSIC] creating local LVGL 9.5 Music Player demo");
 
     s.root = lv_obj_create(lv_layer_top());
     if (s.root == nullptr) {
@@ -544,14 +529,14 @@ static void create_music_ui()
     lv_obj_set_style_radius(s.root, LCD_WIDTH / 2, 0);
     lv_obj_set_style_clip_corner(s.root, true, 0);
 
-    lv_demo_args_t args;
-    lv_demo_args_init(&args);
-    args.parent = s.root;
+    vocat_lv_demo_args_t args = {
+        .parent = s.root,
+    };
 
-    lv_demo_music_with_args(&args);
+    vocat_lv_demo_music_with_args(&args);
     create_music_input();
 
-    ESP_LOGI(TAG, "[MUSIC] official Music Player demo created root=%p",
+    ESP_LOGI(TAG, "[MUSIC] local Music Player demo created root=%p",
              static_cast<void*>(s.root));
 }
 
@@ -996,7 +981,7 @@ extern "C" bool bilibili_story_handle_swipe(int start_x, int start_y, int end_x,
         return false;
     }
 
-    /* The official Music Player owns its gesture handling inside LVGL. */
+    /* The local Music Player demo owns its gesture handling inside LVGL. */
     return true;
 }
 

@@ -46,9 +46,6 @@ set(SOURCES "audio/audio_codec.cc"
             "bilibili/story/bilibili_audio.cpp"
             "bilibili/story/bilibili_ui_lvgl.cpp"
             "bilibili/story/lvgl_music_demo.c"
-            "bilibili/story/music/lv_demo_music.c"
-            "bilibili/story/music/lv_demo_music_main.c"
-            "bilibili/story/music/lv_demo_music_list.c"
             )
 
 # VoCat-local copy of the LVGL Music Player demo.

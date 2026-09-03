@@ -16,7 +16,12 @@
 #define BILIBILI_SERVER_URL BILI_SERVER_DEFAULT
 #endif
 
-#define HTTP_TIMEOUT_MS 10000
+/*
+ * Search on the PC proxy can legitimately take >20 s when Bilibili's WBI
+ * endpoint falls back to verified video search. The request must not expire
+ * on the ESP32 before the server has a chance to return the JSON payload.
+ */
+#define HTTP_TIMEOUT_MS 35000
 #define JSON_BUFFER_SIZE (16 * 1024)
 
 typedef struct {

@@ -9,6 +9,25 @@
  */
 #include "lv_demo_music_main.h"
 #include <stdatomic.h>
+#include <esp_log.h>
+
+#ifndef VOCAT_MUSIC_LOG_LEVEL
+#define VOCAT_MUSIC_LOG_LEVEL 0
+#endif
+
+#if VOCAT_MUSIC_LOG_LEVEL >= 1
+#define MUSIC_LOGW(...) ESP_LOGW("VOCAT_MUSIC", __VA_ARGS__)
+#define MUSIC_LOGE(...) ESP_LOGE("VOCAT_MUSIC", __VA_ARGS__)
+#else
+#define MUSIC_LOGW(...) do { } while (0)
+#define MUSIC_LOGE(...) do { } while (0)
+#endif
+
+#if VOCAT_MUSIC_LOG_LEVEL >= 2
+#define MUSIC_LOGI(...) ESP_LOGI("VOCAT_MUSIC", __VA_ARGS__)
+#else
+#define MUSIC_LOGI(...) do { } while (0)
+#endif
 #if LV_USE_DEMO_MUSIC
 
 #include "lv_demo_music_list.h"

@@ -26,6 +26,30 @@ extern "C" {
 namespace {
 
 constexpr char TAG[] = "BILI_STORY_LVGL";
+
+/* Compile-time logging switch:
+ * 0 = silent
+ * 1 = warnings/errors only
+ * 2 = all diagnostic logs
+ * Override with -DVOCAT_BILI_LOG_LEVEL=2 when detailed logs are needed.
+ */
+#ifndef VOCAT_BILI_LOG_LEVEL
+#define VOCAT_BILI_LOG_LEVEL 0
+#endif
+
+#if VOCAT_BILI_LOG_LEVEL >= 1
+#define BILI_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define BILI_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#else
+#define BILI_LOGE(...) do { } while (0)
+#define BILI_LOGW(...) do { } while (0)
+#endif
+
+#if VOCAT_BILI_LOG_LEVEL >= 2
+#define BILI_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define BILI_LOGI(...) do { } while (0)
+#endif
 constexpr uint32_t LCD_WIDTH = 360;
 constexpr uint32_t LCD_HEIGHT = 360;
 constexpr uint32_t DRAW_BUF_LINES = 30;
@@ -98,7 +122,7 @@ static void log_state(const char* stage)
     Display* base = Board::GetInstance().GetDisplay();
     auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(base);
 
-    ESP_LOGI(
+    BILI_LOGI(
         TAG,
         "[%s] base=%p emote=%p handle=%p panel=%p lvgl_init=%d display=%p active=%d mutex=%p",
         stage,
@@ -121,11 +145,11 @@ static bool ensure_mutex()
 
     lvgl_mutex = xSemaphoreCreateMutex();
     if (lvgl_mutex == nullptr) {
-        ESP_LOGE(TAG, "[LOCK] xSemaphoreCreateMutex failed");
+        BILI_LOGE( "[LOCK] xSemaphoreCreateMutex failed");
         return false;
     }
 
-    ESP_LOGI(TAG, "[LOCK] mutex created: %p", static_cast<void*>(lvgl_mutex));
+    BILI_LOGI( "[LOCK] mutex created: %p", static_cast<void*>(lvgl_mutex));
     return true;
 }
 
@@ -138,7 +162,7 @@ static bool lock_lvgl(TickType_t timeout = pdMS_TO_TICKS(3000))
     BaseType_t ret = xSemaphoreTake(lvgl_mutex, timeout);
 
     if (ret != pdTRUE && timeout != 0) {
-        ESP_LOGW(TAG, "[LOCK] take timeout/fail mutex=%p timeout=%lu ms",
+        BILI_LOGW( "[LOCK] take timeout/fail mutex=%p timeout=%lu ms",
                  static_cast<void*>(lvgl_mutex),
                  static_cast<unsigned long>(pdTICKS_TO_MS(timeout)));
     }
@@ -158,20 +182,20 @@ static emote::EmoteDisplay* get_emote_display()
     Display* display = Board::GetInstance().GetDisplay();
 
     if (display == nullptr) {
-        ESP_LOGE(TAG, "[DISPLAY] Board::GetDisplay() returned NULL");
+        BILI_LOGE( "[DISPLAY] Board::GetDisplay() returned NULL");
         return nullptr;
     }
 
     auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display);
 
     if (emote_display == nullptr) {
-        ESP_LOGE(TAG,
+        BILI_LOGE(
                  "[DISPLAY] current Display is not EmoteDisplay: %p",
                  static_cast<void*>(display));
         return nullptr;
     }
 
-    ESP_LOGI(TAG, "[DISPLAY] EmoteDisplay=%p", static_cast<void*>(emote_display));
+    BILI_LOGI( "[DISPLAY] EmoteDisplay=%p", static_cast<void*>(emote_display));
     return emote_display;
 }
 
@@ -185,37 +209,37 @@ static bool get_panel_from_emote()
     s.emote_display = display;
     s.panel_io = display->GetPanelIo();
 
-    ESP_LOGI(TAG, "[LCD] panel_io=%p", static_cast<void*>(s.panel_io));
+    BILI_LOGI( "[LCD] panel_io=%p", static_cast<void*>(s.panel_io));
 
     if (s.panel_io == nullptr) {
-        ESP_LOGE(TAG, "[LCD] panel_io from EmoteDisplay is NULL");
+        BILI_LOGE( "[LCD] panel_io from EmoteDisplay is NULL");
         return false;
     }
 
     emote_handle_t handle = display->GetEmoteHandle();
     s.emote_handle = handle;
 
-    ESP_LOGI(TAG, "[EMOTE] handle=%p initialized=%d",
+    BILI_LOGI( "[EMOTE] handle=%p initialized=%d",
              static_cast<void*>(handle),
              handle != nullptr && emote_is_initialized(handle) ? 1 : 0);
 
     if (handle == nullptr) {
-        ESP_LOGE(TAG, "[EMOTE] GetEmoteHandle() returned NULL");
+        BILI_LOGE( "[EMOTE] GetEmoteHandle() returned NULL");
         return false;
     }
 
     void* user_data = emote_get_user_data(handle);
 
-    ESP_LOGI(TAG, "[EMOTE] user_data=%p", user_data);
+    BILI_LOGI( "[EMOTE] user_data=%p", user_data);
 
     s.panel = static_cast<esp_lcd_panel_handle_t>(user_data);
 
     if (s.panel == nullptr) {
-        ESP_LOGE(TAG, "[LCD] panel handle from Emote user_data is NULL");
+        BILI_LOGE( "[LCD] panel handle from Emote user_data is NULL");
         return false;
     }
 
-    ESP_LOGI(TAG, "[LCD] panel=%p", static_cast<void*>(s.panel));
+    BILI_LOGI( "[LCD] panel=%p", static_cast<void*>(s.panel));
     return true;
 }
 
@@ -229,27 +253,27 @@ static uint32_t lvgl_tick_get_cb()
 static bool take_over_emote_display()
 {
     if (s.emote_display == nullptr) {
-        ESP_LOGE(TAG, "[EMOTE] takeover failed: display is NULL");
+        BILI_LOGE( "[EMOTE] takeover failed: display is NULL");
         return false;
     }
 
     if (s.flush_done == nullptr) {
         s.flush_done = xSemaphoreCreateBinary();
         if (s.flush_done == nullptr) {
-            ESP_LOGE(TAG, "[LVGL] xSemaphoreCreateBinary failed");
+            BILI_LOGE( "[LVGL] xSemaphoreCreateBinary failed");
             return false;
         }
-        ESP_LOGI(TAG, "[LVGL] flush semaphore created=%p", static_cast<void*>(s.flush_done));
+        BILI_LOGI( "[LVGL] flush semaphore created=%p", static_cast<void*>(s.flush_done));
     }
 
     while (xSemaphoreTake(s.flush_done, 0) == pdTRUE) {
     }
 
-    ESP_LOGI(TAG, "[EMOTE] enabling external display mode");
+    BILI_LOGI( "[EMOTE] enabling external display mode");
     s.emote_display->SetExternalDisplayMode(true);
 
     if (!s.emote_display->WaitForFlushIdle(1000)) {
-        ESP_LOGE(TAG, "[EMOTE] pending flushes did not become idle");
+        BILI_LOGE( "[EMOTE] pending flushes did not become idle");
         s.emote_display->SetExternalDisplayMode(false);
         return false;
     }
@@ -259,7 +283,7 @@ static bool take_over_emote_display()
         static_cast<void*>(s.flush_done)
     );
 
-    ESP_LOGI(TAG, "[EMOTE] LCD ownership handed to LVGL");
+    BILI_LOGI( "[EMOTE] LCD ownership handed to LVGL");
     return true;
 }
 
@@ -269,30 +293,30 @@ static void release_emote_display()
         return;
     }
 
-    ESP_LOGI(TAG, "[EMOTE] clearing LVGL flush callback");
+    BILI_LOGI( "[EMOTE] clearing LVGL flush callback");
     s.emote_display->SetExternalFlushDoneCallback(nullptr, nullptr);
     s.emote_display->SetExternalDisplayMode(false);
-    ESP_LOGI(TAG, "[EMOTE] LCD ownership returned to Emote");
+    BILI_LOGI( "[EMOTE] LCD ownership returned to Emote");
 }
 
 static void hide_emote_ui()
 {
     if (s.emote_handle == nullptr) {
-        ESP_LOGW(TAG, "[EMOTE] hide skipped: handle is NULL");
+        BILI_LOGW( "[EMOTE] hide skipped: handle is NULL");
         return;
     }
 
-    ESP_LOGI(TAG, "[EMOTE] stopping dialog animation");
+    BILI_LOGI( "[EMOTE] stopping dialog animation");
     bool stopped = emote_stop_anim_dialog(s.emote_handle);
-    ESP_LOGI(TAG, "[EMOTE] emote_stop_anim_dialog -> %d", stopped ? 1 : 0);
+    BILI_LOGI( "[EMOTE] emote_stop_anim_dialog -> %d", stopped ? 1 : 0);
 
-    ESP_LOGI(TAG, "[EMOTE] locking manager for visibility change");
+    BILI_LOGI( "[EMOTE] locking manager for visibility change");
     emote_lock(s.emote_handle);
     emote_set_anim_visible(s.emote_handle, false);
     emote_unlock(s.emote_handle);
 
     s.emote_hidden = true;
-    ESP_LOGI(TAG, "[EMOTE] face visibility=false");
+    BILI_LOGI( "[EMOTE] face visibility=false");
 }
 
 static void lvgl_flush_done_from_isr(void* context)
@@ -339,7 +363,7 @@ static void restore_emote_ui()
         return;
     }
 
-    ESP_LOGI(TAG, "[EMOTE] restoring face visibility=true");
+    BILI_LOGI( "[EMOTE] restoring face visibility=true");
 
     emote_lock(s.emote_handle);
     emote_set_anim_visible(s.emote_handle, true);
@@ -356,7 +380,7 @@ static void restore_emote_ui()
 static void flush_cb(lv_display_t* display, const lv_area_t* area, uint8_t* px_map)
 {
     if (s.panel == nullptr || area == nullptr || px_map == nullptr) {
-        ESP_LOGE(TAG, "[FLUSH] invalid args panel=%p area=%p buffer=%p",
+        BILI_LOGE( "[FLUSH] invalid args panel=%p area=%p buffer=%p",
                  static_cast<void*>(s.panel),
                  static_cast<const void*>(area),
                  static_cast<void*>(px_map));
@@ -378,7 +402,7 @@ static void flush_cb(lv_display_t* display, const lv_area_t* area, uint8_t* px_m
     LV_UNUSED(pixels);
 
     if (s.flush_done == nullptr) {
-        ESP_LOGE(TAG, "[FLUSH] completion semaphore is NULL");
+        BILI_LOGE( "[FLUSH] completion semaphore is NULL");
         lv_display_flush_ready(display);
         return;
     }
@@ -400,7 +424,7 @@ static void flush_cb(lv_display_t* display, const lv_area_t* area, uint8_t* px_m
     );
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "[FLUSH] esp_lcd_panel_draw_bitmap failed: %s (0x%x)",
+        BILI_LOGE( "[FLUSH] esp_lcd_panel_draw_bitmap failed: %s (0x%x)",
                  esp_err_to_name(err), static_cast<unsigned>(err));
         s.pending_flush_display = nullptr;
         s.flush_pending = false;
@@ -416,36 +440,36 @@ static bool init_lvgl_runtime()
     log_state("init-enter");
 
     if (!get_panel_from_emote()) {
-        ESP_LOGE(TAG, "[INIT] failed to obtain LCD panel");
+        BILI_LOGE( "[INIT] failed to obtain LCD panel");
         return false;
     }
 
-    ESP_LOGI(TAG, "[LVGL] compile version=%d.%d.%d",
+    BILI_LOGI( "[LVGL] compile version=%d.%d.%d",
              LVGL_VERSION_MAJOR,
              LVGL_VERSION_MINOR,
              LVGL_VERSION_PATCH);
 
-    ESP_LOGI(TAG, "[LVGL] initialized before call=%d",
+    BILI_LOGI( "[LVGL] initialized before call=%d",
              lv_is_initialized() ? 1 : 0);
 
     if (!lv_is_initialized()) {
-        ESP_LOGI(TAG, "[LVGL] calling lv_init()");
+        BILI_LOGI( "[LVGL] calling lv_init()");
         lv_init();
         s.lvgl_initialized_here = true;
     }
 
-    ESP_LOGI(TAG, "[LVGL] initialized after call=%d",
+    BILI_LOGI( "[LVGL] initialized after call=%d",
              lv_is_initialized() ? 1 : 0);
 
     lv_tick_set_cb(lvgl_tick_get_cb);
 
     s.display = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
     if (s.display == nullptr) {
-        ESP_LOGE(TAG, "[LVGL] lv_display_create failed");
+        BILI_LOGE( "[LVGL] lv_display_create failed");
         return false;
     }
 
-    ESP_LOGI(TAG, "[LVGL] display created=%p %lux%lu",
+    BILI_LOGI( "[LVGL] display created=%p %lux%lu",
              static_cast<void*>(s.display),
              static_cast<unsigned long>(LCD_WIDTH),
              static_cast<unsigned long>(LCD_HEIGHT));
@@ -463,13 +487,13 @@ static bool init_lvgl_runtime()
     // Use one DMA buffer. The flush callback waits for the LCD color
     // transfer to finish, so a second buffer is not required here.
 
-    ESP_LOGI(TAG, "[BUF] buf1=%p buf2=%p bytes=%lu",
+    BILI_LOGI( "[BUF] buf1=%p buf2=%p bytes=%lu",
              s.draw_buf_1,
              s.draw_buf_2,
              static_cast<unsigned long>(DRAW_BUF_BYTES));
 
     if (s.draw_buf_1 == nullptr) {
-        ESP_LOGE(TAG, "[BUF] draw buffer allocation failed");
+        BILI_LOGE( "[BUF] draw buffer allocation failed");
 
         if (s.draw_buf_1 != nullptr) {
             heap_caps_free(s.draw_buf_1);
@@ -495,7 +519,7 @@ static bool init_lvgl_runtime()
 
     lv_display_set_default(s.display);
 
-    ESP_LOGI(TAG, "[LVGL] display configured successfully");
+    BILI_LOGI( "[LVGL] display configured successfully");
     log_state("init-done");
     return true;
 }
@@ -523,14 +547,14 @@ static void create_music_input()
     if (s.touch_queue == nullptr) {
         s.touch_queue = xQueueCreate(1, sizeof(State::TouchSample));
         if (s.touch_queue == nullptr) {
-            ESP_LOGE(TAG, "[INPUT] xQueueCreate failed");
+            BILI_LOGE( "[INPUT] xQueueCreate failed");
             return;
         }
     }
 
     s.indev = lv_indev_create();
     if (s.indev == nullptr) {
-        ESP_LOGE(TAG, "[INPUT] lv_indev_create failed");
+        BILI_LOGE( "[INPUT] lv_indev_create failed");
         return;
     }
 
@@ -538,17 +562,17 @@ static void create_music_input()
     lv_indev_set_read_cb(s.indev, music_touch_read_cb);
     lv_indev_set_display(s.indev, s.display);
 
-    ESP_LOGI(TAG, "[INPUT] local Music Player pointer input created=%p",
+    BILI_LOGI( "[INPUT] local Music Player pointer input created=%p",
              static_cast<void*>(s.indev));
 }
 
 static void create_music_ui()
 {
-    ESP_LOGI(TAG, "[MUSIC] creating local LVGL 9.5 Music Player demo");
+    BILI_LOGI( "[MUSIC] creating local LVGL 9.5 Music Player demo");
 
     s.root = lv_obj_create(lv_layer_top());
     if (s.root == nullptr) {
-        ESP_LOGE(TAG, "[MUSIC] failed to create root");
+        BILI_LOGE( "[MUSIC] failed to create root");
         return;
     }
 
@@ -567,7 +591,7 @@ static void create_music_ui()
     vocat_lv_demo_music_with_args(&args);
     create_music_input();
 
-    ESP_LOGI(TAG, "[MUSIC] local Music Player demo created root=%p",
+    BILI_LOGI( "[MUSIC] local Music Player demo created root=%p",
              static_cast<void*>(s.root));
 }
 
@@ -593,7 +617,7 @@ static void restore_audio_after_quiet()
     audio_quiet_applied = false;
 
     if (state == kDeviceStateIdle) {
-        audio.EnableVoiceProcessing(false);
+        audio.EnableVoiceProcessing(true);
         audio.EnableWakeWordDetection(true);
     } else if (state == kDeviceStateListening) {
         audio.EnableVoiceProcessing(true);
@@ -627,10 +651,10 @@ static void apply_audio_policy()
      */
     if (music_playing) {
         if (!external_media_mode_applied) {
-            ESP_LOGI(TAG, "[AUDIO] music active -> disabling AI audio pipeline");
+            BILI_LOGI( "[AUDIO] music active -> disabling AI audio pipeline");
             const int64_t t0 = esp_timer_get_time();
             Application::GetInstance().GetAudioService().SetExternalMediaPlaybackMode(true);
-            ESP_LOGI(TAG, "[AUDIO] external media ON took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
+            BILI_LOGI( "[AUDIO] external media ON took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
             external_media_mode_applied = true;
             audio_quiet_applied = false;
         }
@@ -642,36 +666,36 @@ static void apply_audio_policy()
             return;
         }
 
-        ESP_LOGI(TAG, "[AUDIO] music stopped and touch idle -> leaving external media mode");
+        BILI_LOGI( "[AUDIO] music stopped and touch idle -> leaving external media mode");
         const int64_t t0 = esp_timer_get_time();
         restore_audio_after_quiet();
-        ESP_LOGI(TAG, "[AUDIO] external media OFF/AFE restore took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
+        BILI_LOGI( "[AUDIO] external media OFF/AFE restore took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
         return;
     }
 
     if (touch_busy) {
         if (!audio_quiet_applied) {
-            ESP_LOGI(TAG, "[AUDIO] touch active -> temporarily disabling AI audio pipeline");
+            BILI_LOGI( "[AUDIO] touch active -> temporarily disabling AI audio pipeline");
             auto& audio = Application::GetInstance().GetAudioService();
             const int64_t t0 = esp_timer_get_time();
             audio.EnableVoiceProcessing(false);
             audio.EnableWakeWordDetection(false);
-            ESP_LOGI(TAG, "[AUDIO] AI audio OFF took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
+            BILI_LOGI( "[AUDIO] AI audio OFF took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
             audio_quiet_applied = true;
         }
     }
     else if (audio_quiet_applied) {
-        ESP_LOGI(TAG, "[AUDIO] touch idle -> restoring AI audio pipeline");
+        BILI_LOGI( "[AUDIO] touch idle -> restoring AI audio pipeline");
         const int64_t t0 = esp_timer_get_time();
         restore_audio_after_quiet();
-        ESP_LOGI(TAG, "[AUDIO] AI audio restore took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
+        BILI_LOGI( "[AUDIO] AI audio restore took=%lld us", static_cast<long long>(esp_timer_get_time() - t0));
     }
 }
 
 static void audio_policy_task_entry(void* arg)
 {
     LV_UNUSED(arg);
-    ESP_LOGI(TAG, "[AUDIO] policy task started core=%d priority=%lu stack_free=%lu",
+    BILI_LOGI( "[AUDIO] policy task started core=%d priority=%lu stack_free=%lu",
              xPortGetCoreID(),
              static_cast<unsigned long>(uxTaskPriorityGet(nullptr)),
              static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)));
@@ -699,7 +723,7 @@ static void audio_policy_task_entry(void* arg)
         apply_audio_policy();
     }
 
-    ESP_LOGI(TAG, "[AUDIO] policy task stopped");
+    BILI_LOGI( "[AUDIO] policy task stopped");
     audio_policy_task = nullptr;
     vTaskDelete(nullptr);
 }
@@ -717,7 +741,7 @@ static bool start_audio_policy_task()
             &audio_policy_task,
             AUDIO_POLICY_CORE) != pdPASS) {
         audio_policy_task = nullptr;
-        ESP_LOGE(TAG, "[AUDIO] failed to create policy task");
+        BILI_LOGE( "[AUDIO] failed to create policy task");
         return false;
     }
 
@@ -740,7 +764,7 @@ static void stop_audio_policy_task()
 static void lvgl_task_entry(void* arg)
 {
     LV_UNUSED(arg);
-    ESP_LOGI(TAG, "[LVGL] UI task started core=%d priority=%lu stack_free=%lu",
+    BILI_LOGI( "[LVGL] UI task started core=%d priority=%lu stack_free=%lu",
              xPortGetCoreID(),
              static_cast<unsigned long>(uxTaskPriorityGet(nullptr)),
              static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)));
@@ -775,7 +799,7 @@ static void lvgl_task_entry(void* arg)
                     const uint32_t flush_now = flush_count.load(std::memory_order_relaxed);
                     const uint32_t window_flushes = flush_now - window_flush_prev;
                     if (slow_frames > 0 || window_flushes > 0) {
-                        ESP_LOGI(TAG,
+                        BILI_LOGI(
                                  "[LVGL][PERF] window=%lu avg=%" PRIu64 "us max=%" PRIu32
                                  "us slow=%lu flushes=%" PRIu32 " flush_max=%" PRIu32 "us touch=%d music=%d",
                                  static_cast<unsigned long>(window_frames),
@@ -803,7 +827,7 @@ static void lvgl_task_entry(void* arg)
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 
-    ESP_LOGI(TAG, "[LVGL] UI task stopped");
+    BILI_LOGI( "[LVGL] UI task stopped");
     lvgl_task = nullptr;
     vTaskDelete(nullptr);
 }
@@ -820,7 +844,7 @@ static bool start_lvgl_task()
             &lvgl_task,
             LVGL_CORE) != pdPASS) {
         lvgl_task = nullptr;
-        ESP_LOGE(TAG, "[LVGL] failed to create UI task");
+        BILI_LOGE( "[LVGL] failed to create UI task");
         return false;
     }
     return true;
@@ -839,7 +863,7 @@ static void stop_lvgl_task()
 static bool clear_panel_before_emote()
 {
     if (s.panel == nullptr) {
-        ESP_LOGE(TAG, "[CLOSE] panel is NULL, cannot clear LCD");
+        BILI_LOGE( "[CLOSE] panel is NULL, cannot clear LCD");
         return false;
     }
 
@@ -847,7 +871,7 @@ static bool clear_panel_before_emote()
     constexpr size_t CLEAR_BYTES = LCD_WIDTH * CLEAR_LINES * sizeof(uint16_t);
     static uint16_t clear_buffer[LCD_WIDTH * CLEAR_LINES] = {};
 
-    ESP_LOGI(TAG, "[CLOSE] clearing whole LCD before returning ownership");
+    BILI_LOGI( "[CLOSE] clearing whole LCD before returning ownership");
 
     for (uint32_t y = 0; y < LCD_HEIGHT; y += CLEAR_LINES) {
         const uint32_t y_end = (y + CLEAR_LINES > LCD_HEIGHT) ? LCD_HEIGHT : y + CLEAR_LINES;
@@ -861,7 +885,7 @@ static bool clear_panel_before_emote()
         );
 
         if (err != ESP_OK) {
-            ESP_LOGE(TAG,
+            BILI_LOGE(
                      "[CLOSE] clear failed y=%lu-%lu err=%s (0x%x)",
                      static_cast<unsigned long>(y),
                      static_cast<unsigned long>(y_end),
@@ -872,7 +896,7 @@ static bool clear_panel_before_emote()
 
         if (s.flush_done == nullptr ||
             xSemaphoreTake(s.flush_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
-            ESP_LOGE(TAG,
+            BILI_LOGE(
                      "[CLOSE] timeout waiting for LCD DMA y=%lu-%lu",
                      static_cast<unsigned long>(y),
                      static_cast<unsigned long>(y_end));
@@ -880,29 +904,29 @@ static bool clear_panel_before_emote()
         }
     }
 
-    ESP_LOGI(TAG, "[CLOSE] whole LCD cleared (%lu bytes/segment)",
+    BILI_LOGI( "[CLOSE] whole LCD cleared (%lu bytes/segment)",
              static_cast<unsigned long>(CLEAR_BYTES));
     return true;
 }
 
 static void destroy_lvgl_runtime()
 {
-    ESP_LOGI(TAG, "[DESTROY] begin");
+    BILI_LOGI( "[DESTROY] begin");
 
     if (s.root != nullptr) {
-        ESP_LOGI(TAG, "[DESTROY] deleting root=%p", static_cast<void*>(s.root));
+        BILI_LOGI( "[DESTROY] deleting root=%p", static_cast<void*>(s.root));
         lv_obj_delete(s.root);
         s.root = nullptr;
     }
 
     if (s.indev != nullptr) {
-        ESP_LOGI(TAG, "[DESTROY] deleting input=%p", static_cast<void*>(s.indev));
+        BILI_LOGI( "[DESTROY] deleting input=%p", static_cast<void*>(s.indev));
         lv_indev_delete(s.indev);
         s.indev = nullptr;
     }
 
     if (s.display != nullptr) {
-        ESP_LOGI(TAG, "[DESTROY] deleting display=%p", static_cast<void*>(s.display));
+        BILI_LOGI( "[DESTROY] deleting display=%p", static_cast<void*>(s.display));
         lv_display_set_default(nullptr);
         lv_display_delete(s.display);
         s.display = nullptr;
@@ -930,7 +954,7 @@ static void destroy_lvgl_runtime()
     s.flush_pending = false;
     s.lvgl_initialized_here = false;
 
-    ESP_LOGI(TAG, "[DESTROY] done");
+    BILI_LOGI( "[DESTROY] done");
 }
 
 static bool push_touch_event(int x, int y, lv_indev_state_t state)
@@ -959,23 +983,23 @@ static bool push_touch_event(int x, int y, lv_indev_state_t state)
 
 extern "C" bool bilibili_story_open(void)
 {
-    ESP_LOGI(TAG, "========== BILIBILI LVGL OPEN ==========");
+    BILI_LOGI( "========== BILIBILI LVGL OPEN ==========");
     log_state("open-enter");
 
     if (s.active) {
-        ESP_LOGW(TAG, "[OPEN] already active");
+        BILI_LOGW( "[OPEN] already active");
         return true;
     }
 
     // IMPORTANT: create the mutex before taking it. The previous test build
     // attempted to take a still-null mutex on the first open.
     if (!ensure_mutex()) {
-        ESP_LOGE(TAG, "[OPEN] ensure_mutex failed");
+        BILI_LOGE( "[OPEN] ensure_mutex failed");
         return false;
     }
 
     if (!lock_lvgl()) {
-        ESP_LOGE(TAG, "[OPEN] lock failed");
+        BILI_LOGE( "[OPEN] lock failed");
         return false;
     }
 
@@ -983,20 +1007,20 @@ extern "C" bool bilibili_story_open(void)
 
     do {
         if (!get_panel_from_emote()) {
-            ESP_LOGE(TAG, "[OPEN] failed to obtain Emote display/panel");
+            BILI_LOGE( "[OPEN] failed to obtain Emote display/panel");
             break;
         }
 
         hide_emote_ui();
 
         if (!take_over_emote_display()) {
-            ESP_LOGE(TAG, "[OPEN] failed to take over LCD from Emote");
+            BILI_LOGE( "[OPEN] failed to take over LCD from Emote");
             restore_emote_ui();
             break;
         }
 
         if (!init_lvgl_runtime()) {
-            ESP_LOGE(TAG, "[OPEN] init_lvgl_runtime failed");
+            BILI_LOGE( "[OPEN] init_lvgl_runtime failed");
             release_emote_display();
             restore_emote_ui();
             break;
@@ -1005,7 +1029,7 @@ extern "C" bool bilibili_story_open(void)
         create_music_ui();
 
         if (s.root == nullptr || s.indev == nullptr) {
-            ESP_LOGE(TAG, "[OPEN] music UI creation failed");
+            BILI_LOGE( "[OPEN] music UI creation failed");
             destroy_lvgl_runtime();
             release_emote_display();
             restore_emote_ui();
@@ -1024,7 +1048,7 @@ extern "C" bool bilibili_story_open(void)
         flush_start_us.store(0, std::memory_order_relaxed);
 
         if (!start_lvgl_task()) {
-            ESP_LOGE(TAG, "[OPEN] LVGL UI task start failed");
+            BILI_LOGE( "[OPEN] LVGL UI task start failed");
             s.active = false;
             destroy_lvgl_runtime();
             release_emote_display();
@@ -1033,7 +1057,7 @@ extern "C" bool bilibili_story_open(void)
         }
 
         if (!start_audio_policy_task()) {
-            ESP_LOGE(TAG, "[OPEN] audio policy task start failed");
+            BILI_LOGE( "[OPEN] audio policy task start failed");
             s.active = false;
             stop_lvgl_task();
             destroy_lvgl_runtime();
@@ -1042,7 +1066,7 @@ extern "C" bool bilibili_story_open(void)
             break;
         }
 
-        ESP_LOGI(TAG, "[OPEN] task split: LVGL core=%d priority=4, audio policy core=%d priority=2",
+        BILI_LOGI( "[OPEN] task split: LVGL core=%d priority=4, audio policy core=%d priority=2",
                  static_cast<int>(LVGL_CORE),
                  static_cast<int>(AUDIO_POLICY_CORE));
         ok = true;
@@ -1051,7 +1075,7 @@ extern "C" bool bilibili_story_open(void)
     log_state(ok ? "open-success" : "open-failed");
     unlock_lvgl();
 
-    ESP_LOGI(TAG, "========== BILIBILI LVGL OPEN RESULT=%s ==========",
+    BILI_LOGI( "========== BILIBILI LVGL OPEN RESULT=%s ==========",
              ok ? "SUCCESS" : "FAIL");
 
     return ok;
@@ -1059,15 +1083,15 @@ extern "C" bool bilibili_story_open(void)
 
 extern "C" void bilibili_story_close(void)
 {
-    ESP_LOGI(TAG, "========== BILIBILI LVGL CLOSE ==========");
+    BILI_LOGI( "========== BILIBILI LVGL CLOSE ==========");
 
     if (!ensure_mutex()) {
-        ESP_LOGE(TAG, "[CLOSE] ensure_mutex failed");
+        BILI_LOGE( "[CLOSE] ensure_mutex failed");
         return;
     }
 
     if (!lock_lvgl()) {
-        ESP_LOGE(TAG, "[CLOSE] lock failed");
+        BILI_LOGE( "[CLOSE] lock failed");
         return;
     }
 
@@ -1088,7 +1112,7 @@ extern "C" void bilibili_story_close(void)
     touch_is_down.store(false, std::memory_order_release);
     touch_audio_quiet_until_ms.store(0, std::memory_order_release);
 
-    ESP_LOGI(TAG, "[CLOSE] clearing LVGL pixels before returning LCD ownership");
+    BILI_LOGI( "[CLOSE] clearing LVGL pixels before returning LCD ownership");
     (void)clear_panel_before_emote();
 
     destroy_lvgl_runtime();

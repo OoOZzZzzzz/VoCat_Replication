@@ -746,10 +746,11 @@ static void lvgl_task_entry(void* arg)
              static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)));
 
     uint32_t slow_frames = 0;
-    uint32_t frame_count = 0;
+    uint32_t window_frames = 0;
     uint64_t frame_sum_us = 0;
     uint32_t frame_max_us = 0;
-    uint32_t flush_count_prev = 0;
+    uint32_t window_flush_prev = flush_count.load(std::memory_order_relaxed);
+    int64_t perf_log_deadline_us = esp_timer_get_time() + 5000000LL;
 
     while (!lvgl_task_stop) {
         uint32_t delay_ms = 10;
@@ -759,34 +760,39 @@ static void lvgl_task_entry(void* arg)
                 delay_ms = lv_timer_handler();
                 const int64_t elapsed_us = esp_timer_get_time() - start_us;
 
-                ++frame_count;
+                ++window_frames;
                 frame_sum_us += static_cast<uint64_t>(elapsed_us);
                 if(static_cast<uint32_t>(elapsed_us) > frame_max_us) {
                     frame_max_us = static_cast<uint32_t>(elapsed_us);
                 }
 
-                if (elapsed_us > 30000) {
+                if (elapsed_us > 50000) {
                     ++slow_frames;
-                    ESP_LOGW(TAG,
-                             "[LVGL] slow frame=%" PRIi64 "us count=%lu touch=%d music=%d flush_last=%" PRIu32 "us",
-                             elapsed_us,
-                             static_cast<unsigned long>(slow_frames),
-                             touch_is_down.load(std::memory_order_relaxed) ? 1 : 0,
-                             vocat_lvgl_music_is_playing() ? 1 : 0,
-                             flush_last_us.load(std::memory_order_relaxed));
                 }
 
-                if ((frame_count % 60U) == 0U) {
+                const int64_t now_perf_us = esp_timer_get_time();
+                if (now_perf_us >= perf_log_deadline_us) {
                     const uint32_t flush_now = flush_count.load(std::memory_order_relaxed);
-                    ESP_LOGI(TAG,
-                             "[LVGL][PERF] avg=%" PRIu64 "us max=%" PRIu32 "us frames=60 flushes=%" PRIu32 " flush_max=%" PRIu32 "us",
-                             frame_sum_us / 60U,
-                             frame_max_us,
-                             flush_now - flush_count_prev,
-                             flush_max_us.load(std::memory_order_relaxed));
+                    const uint32_t window_flushes = flush_now - window_flush_prev;
+                    if (slow_frames > 0 || window_flushes > 0) {
+                        ESP_LOGI(TAG,
+                                 "[LVGL][PERF] window=%lu avg=%" PRIu64 "us max=%" PRIu32
+                                 "us slow=%lu flushes=%" PRIu32 " flush_max=%" PRIu32 "us touch=%d music=%d",
+                                 static_cast<unsigned long>(window_frames),
+                                 window_frames ? frame_sum_us / window_frames : 0U,
+                                 frame_max_us,
+                                 static_cast<unsigned long>(slow_frames),
+                                 window_flushes,
+                                 flush_max_us.load(std::memory_order_relaxed),
+                                 touch_is_down.load(std::memory_order_relaxed) ? 1 : 0,
+                                 vocat_lvgl_music_is_playing() ? 1 : 0);
+                    }
+                    window_frames = 0;
                     frame_sum_us = 0;
                     frame_max_us = 0;
-                    flush_count_prev = flush_now;
+                    slow_frames = 0;
+                    window_flush_prev = flush_now;
+                    perf_log_deadline_us = now_perf_us + 5000000LL;
                 }
 
                 if (delay_ms < 5) delay_ms = 5;

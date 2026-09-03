@@ -155,18 +155,10 @@ bool vocat_lv_demo_music_is_playing(void)
 
 void vocat_lv_demo_music_set_touch_active(bool active)
 {
+    /* This function may be called from the board touch task.  It must never
+     * touch an LVGL object from that thread.  The LVGL pulse timer observes
+     * this atomic flag and performs all LVGL updates from the LVGL thread. */
     atomic_store_explicit(&touch_active, active, memory_order_release);
-    if(active) {
-        if(pulse_timer != NULL) {
-            lv_timer_pause(pulse_timer);
-        }
-        if(album_image_obj != NULL) {
-            lv_image_set_scale(album_image_obj, LV_SCALE_NONE);
-        }
-    }
-    else if(atomic_load_explicit(&playing, memory_order_acquire)) {
-        start_album_pulse();
-    }
 }
 
 void vocat_lv_demo_music_pause(void)

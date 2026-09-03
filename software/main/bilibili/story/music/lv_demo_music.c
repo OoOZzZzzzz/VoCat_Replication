@@ -7,66 +7,80 @@
 #include "lv_demo_music_main.h"
 #include "lv_demo_music_list.h"
 
-#define MUSIC_PAGE_HEIGHT 360
-#define MUSIC_PAGE_COUNT 2
-#define MUSIC_SCROLL_ANIM_MS 100
-#define MUSIC_PAGE_MAX_Y (MUSIC_PAGE_HEIGHT * (MUSIC_PAGE_COUNT - 1))
+#define MUSIC_PAGE_HEIGHT       360
+#define MUSIC_PAGE_COUNT        2
+#define MUSIC_SWIPE_ANIM_MS     80
 
 static lv_obj_t * music_root;
 static lv_obj_t * ctrl;
 static lv_obj_t * list;
+static uint8_t music_page;
 
-static void music_page_scroll_cb(lv_event_t * e)
+static void music_page_anim_exec(void * var, int32_t value)
 {
-    lv_obj_t * root = lv_event_get_target(e);
-    int32_t y = lv_obj_get_scroll_y(root);
-
-    /* Never allow the outer page to expose the black area above/below its
-     * two valid screens. This also prevents elastic-looking reverse motion. */
-    if(y < 0) {
-        lv_obj_scroll_to_y(root, 0, LV_ANIM_OFF);
-    }
-    else if(y > MUSIC_PAGE_MAX_Y) {
-        lv_obj_scroll_to_y(root, MUSIC_PAGE_MAX_Y, LV_ANIM_OFF);
-    }
+    lv_obj_t * root = (lv_obj_t *)var;
+    lv_obj_set_y(root, -value);
 }
 
-static void music_page_scroll_end_cb(lv_event_t * e)
+static void music_page_to(uint8_t page, bool animated)
 {
-    lv_obj_t * root = lv_event_get_target(e);
-    int32_t y = lv_obj_get_scroll_y(root);
-    int32_t target = (y >= (MUSIC_PAGE_HEIGHT / 2)) ? MUSIC_PAGE_MAX_Y : 0;
-
-    if(y != target) {
-        lv_obj_set_style_anim_duration(root, MUSIC_SCROLL_ANIM_MS, 0);
-        lv_obj_scroll_to_y(root, target, LV_ANIM_ON);
+    if(page > 1U) {
+        page = 1U;
     }
+
+    const int32_t target_y = (int32_t)page * MUSIC_PAGE_HEIGHT;
+    const int32_t current_y = -lv_obj_get_y(music_root);
+
+    if(current_y == target_y) {
+        music_page = page;
+        return;
+    }
+
+    lv_anim_del(music_root, music_page_anim_exec);
+
+    if(!animated) {
+        lv_obj_set_y(music_root, -target_y);
+        music_page = page;
+        return;
+    }
+
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, music_root);
+    lv_anim_set_values(&anim, current_y, target_y);
+    lv_anim_set_duration(&anim, MUSIC_SWIPE_ANIM_MS);
+    lv_anim_set_exec_cb(&anim, music_page_anim_exec);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
+    lv_anim_start(&anim);
+
+    music_page = page;
 }
 
 static void music_page_gesture_cb(lv_event_t * e)
 {
-    lv_obj_t * root = lv_event_get_target(e);
-    lv_indev_t * indev = lv_indev_active();
-    if(indev == NULL) return;
+    LV_UNUSED(e);
 
-    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
-    int32_t current_y = lv_obj_get_scroll_y(root);
-    int32_t target_y = current_y;
-
-    if(dir == LV_DIR_TOP) {
-        target_y = MUSIC_PAGE_HEIGHT;
-    }
-    else if(dir == LV_DIR_BOTTOM) {
-        target_y = 0;
-    }
-    else {
+    if(music_root == NULL) {
         return;
     }
 
-    lv_obj_set_style_anim_duration(root, MUSIC_SCROLL_ANIM_MS, 0);
-    lv_obj_scroll_to_y(root, target_y, LV_ANIM_ON);
-    LV_LOG_USER("[MUSIC] vertical gesture dir=%d page=%ld->%ld",
-                (int)dir, (long)current_y, (long)target_y);
+    lv_indev_t * indev = lv_indev_active();
+    if(indev == NULL) {
+        return;
+    }
+
+    const lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+
+    /* Page 0 is a hard upper boundary: there is deliberately no reverse
+     * scroll path, overscroll or rubber-band effect. */
+    if(dir == LV_DIR_TOP && music_page == 0U) {
+        LV_LOG_USER("[MUSIC] swipe up: page 0 -> page 1");
+        music_page_to(1U, true);
+    }
+    else if(dir == LV_DIR_BOTTOM && music_page == 1U) {
+        LV_LOG_USER("[MUSIC] swipe down: page 1 -> page 0");
+        music_page_to(0U, true);
+    }
 }
 
 void vocat_lv_demo_music(void)
@@ -91,12 +105,12 @@ void vocat_lv_demo_music_with_args(const vocat_lv_demo_args_t * args)
     lv_obj_set_pos(music_root, 0, 0);
     lv_obj_set_style_bg_opa(music_root, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(music_root, lv_color_hex(0x343247), 0);
-    lv_obj_set_scroll_dir(music_root, LV_DIR_VER);
-    lv_obj_remove_flag(music_root, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
-    lv_obj_clear_flag(music_root, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+    /* Do not use LVGL scrolling for the outer two-page layout. LVGL's
+     * momentum/elastic scroll requires repeated full-screen redraws on the
+     * SPI panel and is the source of the visible jelly/rubber-band motion.
+     * The page transition is therefore an explicit, bounded 360 px move. */
+    lv_obj_clear_flag(music_root, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(music_root, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_add_event_cb(music_root, music_page_scroll_cb, LV_EVENT_SCROLL, NULL);
-    lv_obj_add_event_cb(music_root, music_page_scroll_end_cb, LV_EVENT_SCROLL_END, NULL);
     lv_obj_add_event_cb(music_root, music_page_gesture_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_add_flag(music_root, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
@@ -106,7 +120,8 @@ void vocat_lv_demo_music_with_args(const vocat_lv_demo_args_t * args)
     LV_UNUSED(ctrl);
     LV_UNUSED(list);
 
-    lv_obj_scroll_to_y(music_root, 0, LV_ANIM_OFF);
+    music_page = 0U;
+    lv_obj_set_y(music_root, 0);
 }
 
 const char * vocat_lv_demo_music_get_title(uint32_t track_id)

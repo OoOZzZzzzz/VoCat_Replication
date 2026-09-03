@@ -134,9 +134,9 @@ lv_obj_t * vocat_lv_demo_music_list_create(lv_obj_t * parent)
     lv_obj_remove_style_all(list);
     lv_obj_set_size(list, lv_pct(100), 340);
     lv_obj_set_y(list, 370);
-    lv_obj_set_scroll_dir(list, LV_DIR_VER);
-    lv_obj_remove_flag(list, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_style(list, &style_scrollbar, LV_PART_SCROLLBAR);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
 
@@ -236,8 +236,10 @@ static void btn_click_event_cb(lv_event_t * e)
 
     lv_obj_t * page_root = lv_obj_get_parent(list);
     if(page_root != NULL) {
-        lv_obj_set_style_anim_duration(page_root, 100, 0);
-        lv_obj_scroll_to_y(page_root, 0, LV_ANIM_ON);
+        /* The outer page is not an LVGL scroll container. Jump straight back
+         * to the fixed player page so the list cannot start a nested scroll. */
+        lv_anim_del(page_root, NULL);
+        lv_obj_set_y(page_root, 0);
     }
 }
 

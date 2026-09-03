@@ -14,6 +14,25 @@
 #include <cinttypes>
 #include "esp_idf_version.h"
 
+/* Compile-time touch diagnostics.
+ * 0=silent, 1=press/release, 2=include hold/debug details. */
+#ifndef VOCAT_TOUCH_LOG_LEVEL
+#define VOCAT_TOUCH_LOG_LEVEL 0
+#endif
+
+#if VOCAT_TOUCH_LOG_LEVEL >= 1
+#define VOCAT_TOUCH_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define VOCAT_TOUCH_LOGI(...) do { } while (0)
+#endif
+
+#if VOCAT_TOUCH_LOG_LEVEL >= 2
+#define VOCAT_TOUCH_LOGD(...) ESP_LOGD(TAG, __VA_ARGS__)
+#else
+#define VOCAT_TOUCH_LOGD(...) do { } while (0)
+#endif
+
+
 #define ESP_VOCAT_ENABLE_CAP_TOUCH_SENSOR (ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0))
 
 #include <driver/i2c_master.h>
@@ -392,15 +411,15 @@ public:
             // Press event (transition from not touched to touched)
             press_count_++;
             event = TOUCH_PRESS;
-            ESP_LOGI(TAG, "TOUCH PRESS - count: %d, x: %d, y: %d", press_count_, tp_.x, tp_.y);
+            VOCAT_TOUCH_LOGI("TOUCH PRESS - count: %d, x: %d, y: %d", press_count_, tp_.x, tp_.y);
         } else if (!is_touched && was_touched_) {
             // Release event (transition from touched to not touched)
             event = TOUCH_RELEASE;
-            ESP_LOGI(TAG, "TOUCH RELEASE - total presses: %d", press_count_);
+            VOCAT_TOUCH_LOGI("TOUCH RELEASE - total presses: %d", press_count_);
         } else if (is_touched && was_touched_) {
             // Continuous touch (hold)
             event = TOUCH_HOLD;
-            ESP_LOGD(TAG, "TOUCH HOLD - x: %d, y: %d", tp_.x, tp_.y);
+            VOCAT_TOUCH_LOGD("TOUCH HOLD - x: %d, y: %d", tp_.x, tp_.y);
         }
 
         // Update previous state

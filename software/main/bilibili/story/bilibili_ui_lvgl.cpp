@@ -27,7 +27,7 @@ namespace {
 
 constexpr char TAG[] = "BILI_STORY_LVGL";
 
-/* Compile-time logging switch:
+/* Compile-time logging switch (edit this define when detailed diagnostics are needed):
  * 0 = silent
  * 1 = warnings/errors only
  * 2 = all diagnostic logs
@@ -774,7 +774,7 @@ static void lvgl_task_entry(void* arg)
     uint64_t frame_sum_us = 0;
     uint32_t frame_max_us = 0;
     uint32_t window_flush_prev = flush_count.load(std::memory_order_relaxed);
-    int64_t perf_log_deadline_us = esp_timer_get_time() + 5000000LL;
+    int64_t perf_log_deadline_us = esp_timer_get_time() + 10000000LL;
 
     while (!lvgl_task_stop) {
         uint32_t delay_ms = 10;
@@ -816,7 +816,7 @@ static void lvgl_task_entry(void* arg)
                     frame_max_us = 0;
                     slow_frames = 0;
                     window_flush_prev = flush_now;
-                    perf_log_deadline_us = now_perf_us + 5000000LL;
+                    perf_log_deadline_us = now_perf_us + 10000000LL;
                 }
 
                 if (delay_ms < 5) delay_ms = 5;

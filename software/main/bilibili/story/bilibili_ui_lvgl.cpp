@@ -69,6 +69,10 @@ static TaskHandle_t audio_policy_task = nullptr;
 static volatile bool lvgl_task_stop = false;
 static volatile bool audio_policy_task_stop = false;
 static std::atomic_bool touch_is_down(false);
+static std::atomic<uint32_t> flush_count(0);
+static std::atomic<uint32_t> flush_last_us(0);
+static std::atomic<uint32_t> flush_max_us(0);
+static std::atomic<int64_t> flush_start_us(0);
 
 constexpr uint32_t AUDIO_NOTIFY_TOUCH_DOWN = 1U << 0;
 constexpr uint32_t AUDIO_NOTIFY_TOUCH_UP = 1U << 1;
@@ -299,6 +303,17 @@ static void lvgl_flush_done_from_isr(void* context)
     s.pending_flush_display = nullptr;
     s.flush_pending = false;
 
+    const int64_t start_us = flush_start_us.load(std::memory_order_relaxed);
+    if(start_us > 0) {
+        const uint32_t elapsed = static_cast<uint32_t>(esp_timer_get_time() - start_us);
+        flush_last_us.store(elapsed, std::memory_order_relaxed);
+        uint32_t max_us = flush_max_us.load(std::memory_order_relaxed);
+        while(elapsed > max_us &&
+              !flush_max_us.compare_exchange_weak(max_us, elapsed, std::memory_order_relaxed)) {
+        }
+        flush_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (display != nullptr) {
         lv_display_flush_ready(display);
     }
@@ -373,6 +388,7 @@ static void flush_cb(lv_display_t* display, const lv_area_t* area, uint8_t* px_m
 
     s.pending_flush_display = display;
     s.flush_pending = true;
+    flush_start_us.store(esp_timer_get_time(), std::memory_order_relaxed);
 
     esp_err_t err = esp_lcd_panel_draw_bitmap(
         s.panel,
@@ -489,10 +505,8 @@ static void music_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data)
     LV_UNUSED(indev);
 
     State::TouchSample sample;
-    if (s.touch_queue != nullptr) {
-        while (xQueueReceive(s.touch_queue, &sample, 0) == pdTRUE) {
-            s.last_touch = sample;
-        }
+    if (s.touch_queue != nullptr && xQueueReceive(s.touch_queue, &sample, 0) == pdTRUE) {
+        s.last_touch = sample;
     }
 
     data->point.x = s.last_touch.x;
@@ -542,9 +556,9 @@ static void create_music_ui()
     lv_obj_set_size(s.root, LCD_WIDTH, LCD_HEIGHT);
     lv_obj_center(s.root);
     lv_obj_set_style_bg_opa(s.root, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(s.root, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_radius(s.root, LCD_WIDTH / 2, 0);
-    lv_obj_set_style_clip_corner(s.root, true, 0);
+    lv_obj_set_style_bg_color(s.root, lv_color_hex(0x343247), 0);
+    lv_obj_set_style_radius(s.root, 0, 0);
+    lv_obj_set_style_clip_corner(s.root, false, 0);
 
     vocat_lv_demo_args_t args = {
         .parent = s.root,
@@ -732,7 +746,10 @@ static void lvgl_task_entry(void* arg)
              static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)));
 
     uint32_t slow_frames = 0;
-    uint32_t last_slow_log_ms = 0;
+    uint32_t frame_count = 0;
+    uint64_t frame_sum_us = 0;
+    uint32_t frame_max_us = 0;
+    uint32_t flush_count_prev = 0;
 
     while (!lvgl_task_stop) {
         uint32_t delay_ms = 10;
@@ -742,17 +759,34 @@ static void lvgl_task_entry(void* arg)
                 delay_ms = lv_timer_handler();
                 const int64_t elapsed_us = esp_timer_get_time() - start_us;
 
-                if (elapsed_us > 15000) {
+                ++frame_count;
+                frame_sum_us += static_cast<uint64_t>(elapsed_us);
+                if(static_cast<uint32_t>(elapsed_us) > frame_max_us) {
+                    frame_max_us = static_cast<uint32_t>(elapsed_us);
+                }
+
+                if (elapsed_us > 30000) {
                     ++slow_frames;
-                    const uint32_t now_log_ms = now_ms();
-                    if (elapsed_us > 100000 ||
-                        static_cast<uint32_t>(now_log_ms - last_slow_log_ms) >= 500U) {
-                        last_slow_log_ms = now_log_ms;
-                        ESP_LOGW(TAG,
-                                 "[LVGL] slow frame=%" PRIi64 "us count=%lu",
-                                 elapsed_us,
-                                 static_cast<unsigned long>(slow_frames));
-                    }
+                    ESP_LOGW(TAG,
+                             "[LVGL] slow frame=%" PRIi64 "us count=%lu touch=%d music=%d flush_last=%" PRIu32 "us",
+                             elapsed_us,
+                             static_cast<unsigned long>(slow_frames),
+                             touch_is_down.load(std::memory_order_relaxed) ? 1 : 0,
+                             vocat_lvgl_music_is_playing() ? 1 : 0,
+                             flush_last_us.load(std::memory_order_relaxed));
+                }
+
+                if ((frame_count % 60U) == 0U) {
+                    const uint32_t flush_now = flush_count.load(std::memory_order_relaxed);
+                    ESP_LOGI(TAG,
+                             "[LVGL][PERF] avg=%" PRIu64 "us max=%" PRIu32 "us frames=60 flushes=%" PRIu32 " flush_max=%" PRIu32 "us",
+                             frame_sum_us / 60U,
+                             frame_max_us,
+                             flush_now - flush_count_prev,
+                             flush_max_us.load(std::memory_order_relaxed));
+                    frame_sum_us = 0;
+                    frame_max_us = 0;
+                    flush_count_prev = flush_now;
                 }
 
                 if (delay_ms < 5) delay_ms = 5;
@@ -909,8 +943,10 @@ static bool push_touch_event(int x, int y, lv_indev_state_t state)
         state
     };
 
-    /* Queue length is one by design: the newest point always wins. */
-    return xQueueOverwrite(s.touch_queue, &sample) == pdPASS;
+    /* The queue has length 1 on purpose: LVGL must always consume the newest
+     * pointer position instead of replaying stale drag samples. */
+    xQueueOverwrite(s.touch_queue, &sample);
+    return true;
 }
 
 }  // namespace
@@ -972,9 +1008,14 @@ extern "C" bool bilibili_story_open(void)
 
         s.active = true;
         touch_is_down.store(false, std::memory_order_release);
+        vocat_lv_demo_music_set_touch_active(false);
         touch_audio_quiet_until_ms.store(0, std::memory_order_release);
         audio_quiet_applied = false;
         external_media_mode_applied = false;
+        flush_count.store(0, std::memory_order_relaxed);
+        flush_last_us.store(0, std::memory_order_relaxed);
+        flush_max_us.store(0, std::memory_order_relaxed);
+        flush_start_us.store(0, std::memory_order_relaxed);
 
         if (!start_lvgl_task()) {
             ESP_LOGE(TAG, "[OPEN] LVGL UI task start failed");
@@ -1077,6 +1118,7 @@ extern "C" bool bilibili_story_handle_touch(int x, int y)
     }
 
     touch_is_down.store(false, std::memory_order_release);
+    vocat_lv_demo_music_set_touch_active(false);
     touch_audio_quiet_until_ms.store(
         now_ms() + TOUCH_AUDIO_QUIET_MS,
         std::memory_order_release);
@@ -1099,12 +1141,14 @@ extern "C" bool vocat_bilibili_ui_handle_touch_event(int x, int y, int event)
     if (event == 1 || event == 2) {
         state = LV_INDEV_STATE_PRESSED;
         touch_is_down.store(true, std::memory_order_release);
+        vocat_lv_demo_music_set_touch_active(true);
         if(audio_policy_task != nullptr) {
             (void)xTaskNotify(audio_policy_task, AUDIO_NOTIFY_TOUCH_DOWN, eSetBits);
         }
     }
     else {
         touch_is_down.store(false, std::memory_order_release);
+        vocat_lv_demo_music_set_touch_active(false);
         touch_audio_quiet_until_ms.store(
             now_ms() + TOUCH_AUDIO_QUIET_MS,
             std::memory_order_release);

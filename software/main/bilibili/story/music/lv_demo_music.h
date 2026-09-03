@@ -50,6 +50,9 @@ const char * vocat_lv_demo_music_get_artist(uint32_t track_id);
 const char * vocat_lv_demo_music_get_genre(uint32_t track_id);
 uint32_t vocat_lv_demo_music_get_track_length(uint32_t track_id);
 
+bool vocat_lv_demo_music_is_playing(void);
+void vocat_lv_demo_music_set_touch_active(bool active);
+
 /**********************
  *      MACROS
  **********************/

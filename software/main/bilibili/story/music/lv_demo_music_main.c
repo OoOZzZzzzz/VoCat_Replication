@@ -17,6 +17,10 @@
 #define PLAYER_PAGE_HEIGHT     360
 #define ALBUM_BOX_W            220
 #define ALBUM_BOX_H            205
+#define ALBUM_SCALE_MIN        (LV_SCALE_NONE * 97 / 100)
+#define ALBUM_SCALE_MAX        (LV_SCALE_NONE * 100 / 100)
+#define TRACK_CHANGE_ANIM_MS   280
+#define PULSE_TIMER_MS         66
 
 static lv_obj_t * player_page;
 static lv_obj_t * title_label;
@@ -32,6 +36,10 @@ static const lv_font_t * font_large;
 static uint32_t track_id;
 static uint32_t time_act;
 static atomic_bool playing;
+static atomic_bool touch_active;
+static lv_anim_t album_anim;
+static lv_timer_t * pulse_timer;
+static uint8_t pulse_phase;
 
 static lv_obj_t * create_player_page(lv_obj_t * parent);
 static lv_obj_t * create_title_box(lv_obj_t * parent);
@@ -44,7 +52,12 @@ static void prev_click_event_cb(lv_event_t * e);
 static void next_click_event_cb(lv_event_t * e);
 static void timer_cb(lv_timer_t * t);
 static void del_counter_timer_cb(lv_event_t * e);
+static void pulse_timer_cb(lv_timer_t * t);
+static void track_anim_opa_cb(void * obj, int32_t opa);
+static void track_anim_scale_cb(void * obj, int32_t scale);
 static void track_load(uint32_t id);
+static void start_album_pulse(void);
+static void stop_album_pulse(void);
 
 static void set_album_source(lv_obj_t * img, uint32_t id)
 {
@@ -89,6 +102,7 @@ lv_obj_t * vocat_lv_demo_music_main_create(lv_obj_t * parent)
     track_id = 0;
     time_act = 0;
     atomic_init(&playing, false);
+    atomic_init(&touch_active, false);
 
     player_page = create_player_page(parent);
     return player_page;
@@ -130,12 +144,29 @@ void vocat_lv_demo_music_resume(void)
         lv_timer_resume(sec_counter_timer);
     }
 
+    start_album_pulse();
     vocat_lv_demo_music_list_button_check(track_id, true);
 }
 
 bool vocat_lv_demo_music_is_playing(void)
 {
     return atomic_load_explicit(&playing, memory_order_acquire);
+}
+
+void vocat_lv_demo_music_set_touch_active(bool active)
+{
+    atomic_store_explicit(&touch_active, active, memory_order_release);
+    if(active) {
+        if(pulse_timer != NULL) {
+            lv_timer_pause(pulse_timer);
+        }
+        if(album_image_obj != NULL) {
+            lv_image_set_scale(album_image_obj, LV_SCALE_NONE);
+        }
+    }
+    else if(atomic_load_explicit(&playing, memory_order_acquire)) {
+        start_album_pulse();
+    }
 }
 
 void vocat_lv_demo_music_pause(void)
@@ -146,6 +177,7 @@ void vocat_lv_demo_music_pause(void)
         lv_timer_pause(sec_counter_timer);
     }
 
+    stop_album_pulse();
     lv_image_set_scale(album_image_obj, LV_SCALE_NONE);
     lv_obj_remove_state(play_obj, LV_STATE_CHECKED);
     vocat_lv_demo_music_list_button_check(track_id, false);
@@ -334,20 +366,53 @@ static void track_load(uint32_t id)
 
     vocat_lv_demo_music_list_button_check(track_id, false);
     track_id = id;
-    vocat_lv_demo_music_list_button_check(
-        track_id,
-        atomic_load_explicit(&playing, memory_order_acquire));
+    vocat_lv_demo_music_list_button_check(track_id, atomic_load_explicit(&playing, memory_order_acquire));
 
     lv_label_set_text(title_label, vocat_lv_demo_music_get_title(track_id));
     lv_label_set_text(artist_label, vocat_lv_demo_music_get_artist(track_id));
     lv_label_set_text(genre_label, vocat_lv_demo_music_get_genre(track_id));
 
-    /* Instant album replacement. Resizing/fading a large image produces a
-     * large redraw on the 360x360 SPI display and can stall the UI task. */
     lv_anim_delete(album_image_obj, NULL);
-    lv_obj_set_style_image_opa(album_image_obj, LV_OPA_COVER, 0);
-    lv_image_set_scale(album_image_obj, LV_SCALE_NONE);
     set_album_source(album_image_obj, track_id);
+    lv_obj_set_style_image_opa(album_image_obj, LV_OPA_TRANSP, 0);
+    lv_image_set_scale(album_image_obj, ALBUM_SCALE_MIN);
+
+    lv_anim_init(&album_anim);
+    lv_anim_set_var(&album_anim, album_image_obj);
+    lv_anim_set_values(&album_anim, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_duration(&album_anim, TRACK_CHANGE_ANIM_MS);
+    lv_anim_set_exec_cb(&album_anim, track_anim_opa_cb);
+    lv_anim_start(&album_anim);
+
+    lv_anim_init(&album_anim);
+    lv_anim_set_var(&album_anim, album_image_obj);
+    lv_anim_set_values(&album_anim, ALBUM_SCALE_MIN, LV_SCALE_NONE);
+    lv_anim_set_duration(&album_anim, TRACK_CHANGE_ANIM_MS);
+    lv_anim_set_exec_cb(&album_anim, track_anim_scale_cb);
+    lv_anim_start(&album_anim);
+}
+
+static void start_album_pulse(void)
+{
+    if(album_image_obj == NULL) return;
+
+    if(pulse_timer == NULL) {
+        pulse_phase = 0;
+        pulse_timer = lv_timer_create(pulse_timer_cb, PULSE_TIMER_MS, NULL);
+    }
+    else {
+        lv_timer_resume(pulse_timer);
+    }
+}
+
+static void stop_album_pulse(void)
+{
+    if(pulse_timer != NULL) {
+        lv_timer_pause(pulse_timer);
+    }
+    if(album_image_obj != NULL) {
+        lv_image_set_scale(album_image_obj, LV_SCALE_NONE);
+    }
 }
 
 static void album_gesture_event_cb(lv_event_t * e)
@@ -407,6 +472,41 @@ static void del_counter_timer_cb(lv_event_t * e)
         lv_timer_delete(sec_counter_timer);
         sec_counter_timer = NULL;
     }
+    if(pulse_timer != NULL) {
+        lv_timer_delete(pulse_timer);
+        pulse_timer = NULL;
+    }
+}
+
+static void pulse_timer_cb(lv_timer_t * t)
+{
+    LV_UNUSED(t);
+    if(album_image_obj == NULL ||
+       !atomic_load_explicit(&playing, memory_order_acquire) ||
+       atomic_load_explicit(&touch_active, memory_order_acquire)) {
+        return;
+    }
+
+    /* 30 Hz, very small pulse: enough to keep the artwork alive without
+     * forcing LVGL to rescale the image on every timer-handler iteration. */
+    pulse_phase = (uint8_t)((pulse_phase + 1U) & 0x1FU);
+    uint8_t p = pulse_phase;
+    if(p > 16U) p = (uint8_t)(32U - p);
+
+    const uint16_t span = ALBUM_SCALE_MAX - ALBUM_SCALE_MIN;
+    const uint16_t scale = (uint16_t)(ALBUM_SCALE_MIN +
+                                      ((uint32_t)span * p) / 16U);
+    lv_image_set_scale(album_image_obj, scale);
+}
+
+static void track_anim_opa_cb(void * obj, int32_t opa)
+{
+    lv_obj_set_style_image_opa((lv_obj_t *)obj, (lv_opa_t)opa, 0);
+}
+
+static void track_anim_scale_cb(void * obj, int32_t scale)
+{
+    lv_image_set_scale((lv_obj_t *)obj, (uint16_t)scale);
 }
 
 #endif /* LV_USE_DEMO_MUSIC */

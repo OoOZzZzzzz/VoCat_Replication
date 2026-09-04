@@ -51,7 +51,6 @@ constexpr uint32_t LCD_WIDTH = 360;
 constexpr uint32_t LCD_HEIGHT = 360;
 constexpr uint32_t DRAW_BUF_LINES = 30;
 constexpr uint32_t DRAW_BUF_BYTES = LCD_WIDTH * DRAW_BUF_LINES * sizeof(uint16_t);
-constexpr uint32_t TOUCH_QUIET_MS = 700;
 constexpr uint32_t LVGL_WAKE_NOTIFY = 1U << 0;
 constexpr uint32_t LVGL_COMMAND_NOTIFY = 1U << 1;
 constexpr uint32_t LVGL_DATA_NOTIFY = 1U << 2;
@@ -74,6 +73,7 @@ enum class Command : uint8_t {
 
 struct State {
     std::atomic<bool> active{false};
+    std::atomic<bool> touch_active{false};
     bool emote_hidden = false;
     bool runtime_ready = false;
     bool input_ready = false;
@@ -118,8 +118,6 @@ std::atomic<Command> pending_command{Command::None};
 std::atomic<int> pending_index{-1};
 std::atomic<uint8_t> failed_mask{0};
 char current_audio_bvid[BILI_BVID_MAX_LEN + 1] = {};
-std::atomic<bool> touch_down{false};
-std::atomic<uint32_t> touch_quiet_until_ms{0};
 std::atomic<bool> lvgl_task_stop{false};
 bool audio_media_applied = false;
 bool audio_quiet_applied = false;
@@ -275,14 +273,24 @@ static bool create_music_ui()
     vocat_lv_demo_music_with_args(&args);
     vocat_lv_demo_music_set_state_callback([](bool playing, uint32_t id) {
         const bili_video_t *track = vocat_lv_demo_music_get_track(id);
+        BILI_LOGI("[PLAY_STATE] playing=%d id=%u track=%p bvid=%s running=%d paused=%d failed_mask=0x%02x",
+                  playing ? 1 : 0, id, static_cast<const void *>(track),
+                  (track && track->bvid[0]) ? track->bvid : "<none>",
+                  bilibili_audio_is_running() ? 1 : 0,
+                  bilibili_audio_is_paused() ? 1 : 0,
+                  static_cast<unsigned>(failed_mask.load(std::memory_order_acquire)));
         if (!playing) {
             bilibili_audio_set_paused(true);
             return;
         }
-        if (!track || !track->bvid[0]) return;
+        if (!track || !track->bvid[0]) {
+            BILI_LOGW("[PLAY_STATE] playing requested but track is invalid id=%u", id);
+            return;
+        }
 
         if (std::strcmp(current_audio_bvid, track->bvid) == 0 &&
             bilibili_audio_is_running()) {
+            BILI_LOGI("[PLAY_STATE] resume existing bvid=%s id=%u", track->bvid, id);
             bilibili_audio_set_paused(false);
             return;
         }
@@ -290,15 +298,19 @@ static bool create_music_ui()
         failed_mask.fetch_and(static_cast<uint8_t>(~(1U << id)));
         std::strncpy(current_audio_bvid, track->bvid, sizeof(current_audio_bvid) - 1);
         current_audio_bvid[sizeof(current_audio_bvid) - 1] = '\0';
+        BILI_LOGI("[PLAY_STATE] start audio id=%u bvid=%s", id, track->bvid);
         if (!bilibili_audio_start_ex(track->bvid,
                                      [](void *) {
+                                         BILI_LOGI("[PLAY] EOF -> queue next");
                                          pending_command.store(Command::Next, std::memory_order_release);
                                          if (lvgl_task) xTaskNotify(lvgl_task, LVGL_COMMAND_NOTIFY, eSetBits);
                                      },
                                      [](void *arg, int error_code) {
                                          const uint32_t id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(arg));
                                          failed_mask.fetch_or(static_cast<uint8_t>(1U << id), std::memory_order_acq_rel);
-                                         BILI_LOGW("[PLAY] track=%u failed error=%d -> auto skip", id, error_code);
+                                         BILI_LOGW("[PLAY] track=%u failed error=%d -> auto skip mask=0x%02x",
+                                                   id, error_code,
+                                                   static_cast<unsigned>(failed_mask.load(std::memory_order_acquire)));
                                          pending_command.store(Command::Next, std::memory_order_release);
                                          if (lvgl_task) xTaskNotify(lvgl_task, LVGL_COMMAND_NOTIFY, eSetBits);
                                      },
@@ -432,10 +444,24 @@ static void process_command()
 
 static void apply_audio_policy()
 {
-    const bool playing = vocat_lv_demo_music_is_playing() && bilibili_audio_is_running();
-    const bool touching = touch_down.load(std::memory_order_acquire) ||
-                          static_cast<int32_t>(touch_quiet_until_ms.load() - now_ms()) > 0;
+    const bool touch_active = s.touch_active.load(std::memory_order_acquire);
+    const bool playing = vocat_lv_demo_music_is_playing() &&
+                         bilibili_audio_is_running() &&
+                         !bilibili_audio_is_paused();
     auto &audio = Application::GetInstance().GetAudioService();
+
+    if (touch_active) {
+        if (!audio_quiet_applied) {
+            audio.EnableVoiceProcessing(false);
+            audio.EnableWakeWordDetection(false);
+            audio_quiet_applied = true;
+            BILI_LOGI("[AI] touch active -> AI input paused; Bilibili playback unchanged");
+        }
+    } else if (audio_quiet_applied && !playing) {
+        audio_quiet_applied = false;
+        last_device_state = -1;
+        BILI_LOGI("[AI] touch released -> restore AI policy");
+    }
 
     if (playing) {
         if (!wifi_ps_applied) {
@@ -447,14 +473,13 @@ static void apply_audio_policy()
         if (!audio_media_applied) {
             audio.SetExternalMediaPlaybackMode(true);
             audio_media_applied = true;
-            audio_quiet_applied = false;
             last_device_state = -1;
+            BILI_LOGI("[AUDIO] external media mode ON");
         }
         return;
     }
 
     if (audio_media_applied) {
-        if (touching) return;
         audio.SetExternalMediaPlaybackMode(false);
         audio_media_applied = false;
         if (wifi_ps_applied) {
@@ -463,21 +488,13 @@ static void apply_audio_policy()
             BILI_LOGI("[POWER] playback wifi_ps restore ret=%s", esp_err_to_name(ps_ret));
         }
         last_device_state = -1;
+        BILI_LOGI("[AUDIO] external media mode OFF");
     }
 
-    if (touching) {
-        if (!audio_quiet_applied) {
-            audio.EnableVoiceProcessing(false);
-            audio.EnableWakeWordDetection(false);
-            audio_quiet_applied = true;
-            last_device_state = -1;
-        }
-        return;
-    }
+    if (touch_active) return;
 
     const int state = static_cast<int>(Application::GetInstance().GetDeviceState());
-    if (audio_quiet_applied || state != last_device_state) {
-        audio_quiet_applied = false;
+    if (state != last_device_state) {
         if (state == static_cast<int>(kDeviceStateIdle)) {
             audio.EnableVoiceProcessing(true);
             audio.EnableWakeWordDetection(true);
@@ -495,6 +512,7 @@ static void apply_audio_policy()
         last_device_state = state;
     }
 }
+
 static void lvgl_task_entry(void *)
 {
     uint32_t policy_deadline = now_ms();
@@ -658,11 +676,10 @@ extern "C" bool bilibili_story_open(void)
         return false;
     }
 
+    s.touch_active.store(false, std::memory_order_release);
     s.active = true;
     s.runtime_ready = true;
     s.input_ready = true;
-    touch_down.store(false);
-    touch_quiet_until_ms.store(0);
     audio_media_applied = false;
     audio_quiet_applied = false;
     last_device_state = -1;
@@ -677,6 +694,7 @@ extern "C" bool bilibili_story_open(void)
     }
     if (!start_lvgl_task()) {
         s.active = false;
+    s.touch_active.store(false, std::memory_order_release);
         destroy_lvgl_runtime();
         release_display();
         restore_emote();
@@ -788,18 +806,17 @@ extern "C" bool bilibili_story_handle_touch(int x, int y)
 extern "C" bool vocat_bilibili_ui_handle_touch_event(int x, int y, int event)
 {
     if (!s.active) return false;
-    if (event == 1 || event == 2) {
-        touch_down.store(true, std::memory_order_release);
-        touch_quiet_until_ms.store(now_ms() + TOUCH_QUIET_MS, std::memory_order_release);
-        vocat_lv_demo_music_set_touch_active(true);
-        push_touch(x, y, LV_INDEV_STATE_PRESSED);
-        if (lvgl_task) xTaskNotify(lvgl_task, LVGL_WAKE_NOTIFY, eSetBits);
-    } else {
-        touch_down.store(false, std::memory_order_release);
-        touch_quiet_until_ms.store(now_ms() + TOUCH_QUIET_MS, std::memory_order_release);
-        vocat_lv_demo_music_set_touch_active(false);
-        push_touch(x, y, LV_INDEV_STATE_RELEASED);
-        if (lvgl_task) xTaskNotify(lvgl_task, LVGL_WAKE_NOTIFY, eSetBits);
+
+    const bool pressed = (event == 1 || event == 2);
+    const bool previous = s.touch_active.exchange(pressed, std::memory_order_acq_rel);
+
+    // This only controls the music demo's touch visual state and the AI input
+    // policy. It never calls bilibili_audio_set_paused().
+    vocat_lv_demo_music_set_touch_active(pressed);
+    push_touch(x, y, pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED);
+
+    if (previous != pressed && lvgl_task) {
+        (void)xTaskNotify(lvgl_task, LVGL_WAKE_NOTIFY, eSetBits);
     }
     return true;
 }

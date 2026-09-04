@@ -632,7 +632,11 @@ def start_audio_ffmpeg(bvid):
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
-        "-re", "-i", au,
+        # Do not use FFmpeg -re for audio. The source is already a network
+        # stream and -re throttles demuxing to timestamp pace; during source
+        # jitter this turns short upstream stalls into progressively larger
+        # output starvation. The ESP32/HTTP layer provides the playback queue.
+        "-i", au,
         "-vn", "-af", "aresample=async=1:first_pts=0",
         "-ac", "1", "-ar", str(AUDIO_RATE),
         "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1",
@@ -1080,7 +1084,8 @@ def api_bili_audio_stream():
         log(f"[ASTREAM] reject bad bvid={bvid!r}")
         return Response("bad bvid", status=400, mimetype="text/plain")
 
-    log(f"[ASTREAM] request bvid={bvid}")
+    request_started = time.monotonic()
+    log(f"[ASTREAM] request bvid={bvid} client={request.remote_addr}:{request.environ.get('REMOTE_PORT', '?')}")
 
     try:
         proc = start_audio_ffmpeg(bvid)
@@ -1158,6 +1163,8 @@ def api_bili_audio_stream():
 
     def gen():
         sent = 0
+        chunks = 0
+        last_log = time.monotonic()
         try:
             # Send the deterministic startup buffer first.
             offset = 0
@@ -1169,11 +1176,12 @@ def api_bili_audio_stream():
                 payload = bytes(first[offset:end])
                 offset = end
                 sent += len(payload)
+                chunks += 1
                 yield payload
 
-            # Then preserve the server's 100 ms PCM cadence. FFmpeg is
-            # intentionally started with -re because AudioService keeps only
-            # ~300 ms of direct PCM and drops old frames when that queue is full.
+            # AudioService consumes the PCM at the hardware playback rate.
+            # FFmpeg therefore runs uncapped and the ESP32-side queue provides
+            # the small amount of pacing/buffering needed for playback.
             while True:
                 chunk = proc.stdout.read(AUDIO_BYTES)
                 if not chunk:
@@ -1188,17 +1196,25 @@ def api_bili_audio_stream():
                     continue
 
                 sent += len(chunk)
+                chunks += 1
+                now = time.monotonic()
+                if now - last_log >= 10.0:
+                    log(
+                        f"[ASTREAM] progress bvid={bvid} sent={sent} chunks={chunks} "
+                        f"elapsed_s={now - request_started:.1f} ffmpeg_rc={proc.poll()}"
+                    )
+                    last_log = now
                 yield chunk
 
         except GeneratorExit:
             log(
                 f"[ASTREAM] client disconnected bvid={bvid} "
-                f"sent={sent}"
+                f"sent={sent} chunks={chunks} elapsed_s={time.monotonic() - request_started:.1f}"
             )
         except (ConnectionError, BrokenPipeError, OSError) as exc:
             log(
                 f"[ASTREAM] client connection lost bvid={bvid} "
-                f"error={exc} sent={sent}"
+                f"error={exc} sent={sent} chunks={chunks} elapsed_s={time.monotonic() - request_started:.1f}"
             )
         except Exception as exc:
             log(
@@ -1209,7 +1225,7 @@ def api_bili_audio_stream():
             kill_process(proc)
             log(
                 f"[ASTREAM] done bvid={bvid} "
-                f"sent={sent} rc={proc.poll()}"
+                f"sent={sent} chunks={chunks} rc={proc.poll()} elapsed_s={time.monotonic() - request_started:.1f}"
             )
 
     return Response(

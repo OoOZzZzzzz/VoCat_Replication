@@ -210,9 +210,11 @@ void AudioService::SetExternalMediaPlaybackMode(bool enable)
         // Drop any pending cloud TTS/Opus audio so Bilibili owns the speaker.
         ResetDecoder();
 
-        // Keep PCM output responsive but give the video decoder more CPU.
+        // Keep the audio output task at its normal priority. Lowering it while
+        // Bilibili is playing allows the PCM queue to drain too slowly and
+        // produces audible underruns/stutter.
         if (audio_output_task_handle_ != nullptr) {
-            vTaskPrioritySet(audio_output_task_handle_, 3);
+            vTaskPrioritySet(audio_output_task_handle_, 4);
         }
     } else {
         ESP_LOGI(TAG, "Leaving external media playback mode");
@@ -244,14 +246,20 @@ bool AudioService::PushPcmToPlaybackQueue(const int16_t* pcm, size_t samples, in
         return false;
     }
 
-    /*
-     * Bilibili is a live media source. Never block the network reader waiting
-     * for AudioOutputTask. Keeping at most ~300 ms of direct media PCM avoids
-     * back-pressure from audio starving the video stream.
-     */
+    // Keep a small, deterministic direct-media buffer. Never discard already
+    // decoded PCM: dropping a 100 ms block is heard as an immediate audio
+    // glitch. The producer waits briefly for AudioOutputTask to consume space.
     constexpr size_t kDirectPcmMaxQueue = 3;
-    while (audio_playback_queue_.size() >= kDirectPcmMaxQueue) {
-        audio_playback_queue_.pop_front();
+    const bool available = audio_queue_cv_.wait_for(
+        lock, std::chrono::milliseconds(120), [this]() {
+            return service_stopped_.load() ||
+                   audio_playback_queue_.size() < kDirectPcmMaxQueue;
+        });
+
+    if (!available || service_stopped_.load()) {
+        ESP_LOGW(TAG, "Direct PCM queue timeout size=%u",
+                 static_cast<unsigned>(audio_playback_queue_.size()));
+        return false;
     }
 
     playback_drained_notified_ = false;
@@ -381,12 +389,16 @@ void AudioService::AudioInputTask() {
             }
         }
 
-        /* Feed the selected audio engine */
+            /* Feed the selected audio engine */
         if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
             int samples = 160; // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
                 audio_engine_->Feed(std::move(data));
+                // AFE processing can occupy CPU0 for a long time. Yielding
+                // by one tick gives IDLE0 a real scheduling opportunity and
+                // prevents the task watchdog from starving IDLE0.
+                vTaskDelay(pdMS_TO_TICKS(1));
                 continue;
             }
         }

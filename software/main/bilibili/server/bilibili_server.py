@@ -1,4 +1,5 @@
 import os
+import queue
 import socket
 import struct
 import subprocess
@@ -1161,47 +1162,76 @@ def api_bili_audio_stream():
             mimetype="text/plain"
         )
 
+    audio_q = queue.Queue(maxsize=12)  # 1.2 s bounded PCM prefetch on the PC
+    producer_done = threading.Event()
+
+    def producer():
+        produced = 0
+        try:
+            while True:
+                raw = proc.stdout.read(AUDIO_BYTES * 8)
+                if not raw:
+                    rc = proc.poll()
+                    if rc is not None:
+                        break
+                    time.sleep(0.005)
+                    continue
+                for off in range(0, len(raw), AUDIO_BYTES):
+                    item = raw[off:off + AUDIO_BYTES]
+                    if len(item) < AUDIO_BYTES:
+                        continue
+                    while True:
+                        try:
+                            audio_q.put(item, timeout=0.5)
+                            produced += 1
+                            break
+                        except queue.Full:
+                            if producer_done.is_set():
+                                return
+        except Exception as exc:
+            log(f"[ASTREAM][PRODUCER] error bvid={bvid} type={type(exc).__name__} error={exc}")
+        finally:
+            producer_done.set()
+            try:
+                audio_q.put_nowait(None)
+            except queue.Full:
+                pass
+            log(f"[ASTREAM][PRODUCER] done bvid={bvid} chunks={produced} rc={proc.poll()}")
+
+    producer_thread = threading.Thread(target=producer, name=f"audio-prefetch-{bvid}", daemon=True)
+    producer_thread.start()
+
     def gen():
         sent = 0
         chunks = 0
         last_log = time.monotonic()
         try:
-            # Send the deterministic startup buffer first.
             offset = 0
             while offset < len(first):
-                end = min(
-                    offset + AUDIO_BYTES,
-                    len(first)
-                )
+                end = min(offset + AUDIO_BYTES, len(first))
                 payload = bytes(first[offset:end])
                 offset = end
                 sent += len(payload)
                 chunks += 1
                 yield payload
 
-            # AudioService consumes the PCM at the hardware playback rate.
-            # FFmpeg therefore runs uncapped and the ESP32-side queue provides
-            # the small amount of pacing/buffering needed for playback.
             while True:
-                chunk = proc.stdout.read(AUDIO_BYTES)
-                if not chunk:
-                    rc = proc.poll()
-                    if rc is not None:
-                        log(
-                            f"[ASTREAM] ffmpeg EOF bvid={bvid} "
-                            f"rc={rc} sent={sent}"
-                        )
+                try:
+                    chunk = audio_q.get(timeout=5.0)
+                except queue.Empty:
+                    if producer_done.is_set():
                         break
-                    time.sleep(0.01)
+                    log(f"[ASTREAM] prefetch starvation bvid={bvid} sent={sent} chunks={chunks}")
                     continue
-
+                if chunk is None:
+                    break
                 sent += len(chunk)
                 chunks += 1
                 now = time.monotonic()
                 if now - last_log >= 10.0:
                     log(
                         f"[ASTREAM] progress bvid={bvid} sent={sent} chunks={chunks} "
-                        f"elapsed_s={now - request_started:.1f} ffmpeg_rc={proc.poll()}"
+                        f"elapsed_s={now - request_started:.1f} prefetch={audio_q.qsize()} ffmpeg_rc={proc.poll()}"
                     )
                     last_log = now
                 yield chunk
@@ -1222,7 +1252,9 @@ def api_bili_audio_stream():
                 f"type={type(exc).__name__} error={exc}"
             )
         finally:
+            producer_done.set()
             kill_process(proc)
+            producer_thread.join(timeout=0.2)
             log(
                 f"[ASTREAM] done bvid={bvid} "
                 f"sent={sent} chunks={chunks} rc={proc.poll()} elapsed_s={time.monotonic() - request_started:.1f}"

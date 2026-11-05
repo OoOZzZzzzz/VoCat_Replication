@@ -246,19 +246,21 @@ bool AudioService::PushPcmToPlaybackQueue(const int16_t* pcm, size_t samples, in
         return false;
     }
 
-    // Keep a small, deterministic direct-media buffer. Never discard already
-    // decoded PCM: dropping a 100 ms block is heard as an immediate audio
-    // glitch. The producer waits briefly for AudioOutputTask to consume space.
+    // Keep a bounded direct-media buffer. During Bilibili playback the producer
+    // is allowed to block until AudioOutputTask consumes space, which applies
+    // back-pressure instead of dropping decoded PCM and causing audible gaps.
     constexpr size_t kDirectPcmMaxQueue = 3;
     const bool available = audio_queue_cv_.wait_for(
-        lock, std::chrono::milliseconds(120), [this]() {
+        lock, std::chrono::milliseconds(1000), [this]() {
             return service_stopped_.load() ||
                    audio_playback_queue_.size() < kDirectPcmMaxQueue;
         });
 
     if (!available || service_stopped_.load()) {
-        ESP_LOGW(TAG, "Direct PCM queue timeout size=%u",
-                 static_cast<unsigned>(audio_playback_queue_.size()));
+        ESP_LOGW(TAG, "Direct PCM queue timeout size=%u internal_free=%u internal_largest=%u",
+                 static_cast<unsigned>(audio_playback_queue_.size()),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
         return false;
     }
 
@@ -890,6 +892,9 @@ bool AudioService::MarkPlaybackDrainedLocked() {
 }
 
 void AudioService::CheckAndUpdateAudioPowerState() {
+    if (external_media_playback_.load()) {
+        return;
+    }
     auto now = std::chrono::steady_clock::now();
     auto input_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_input_time_).count();
     auto output_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time_).count();
